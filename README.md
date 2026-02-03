@@ -1,44 +1,120 @@
-# Modal GRPO - Serverless GRPO Training with TRL and vLLM
+# MRL - Modal Reinforcement Learning
 
-A veRL-style serverless architecture for GRPO (Group Relative Policy Optimization) training on Modal, using TRL's GRPOTrainer and standalone vLLM workers.
+A veRL-style serverless architecture for GRPO (Group Relative Policy Optimization) training on [Modal](https://modal.com), using TRL's GRPOTrainer and standalone vLLM workers.
 
-## Overview
+## What is GRPO?
 
-This package implements distributed GRPO training with a clean separation of concerns:
-- **Actor Worker**: Handles policy training using TRL's GRPOTrainer
-- **Rollout Workers**: Handle fast inference using standalone vLLM (horizontally scalable)
-- **Reward Workers**: Execute generated code in secure Modal Sandboxes
+**GRPO (Group Relative Policy Optimization)** is a reinforcement learning algorithm introduced by DeepSeek that improves language models through reward-based learning. Unlike traditional RL methods that require a separate critic network, GRPO uses a simpler approach:
 
-The architecture is inspired by [veRL](https://github.com/volcengine/verl) and designed for serverless execution on [Modal](https://modal.com).
+1. **Generate multiple completions** for each prompt (e.g., 4 different responses)
+2. **Score each completion** using a reward function (e.g., code execution tests)
+3. **Compute relative advantages** - compare completions within the same group
+4. **Update the policy** to increase probability of higher-reward completions
 
-## Architecture
+The loss function is:
+```
+L = -E[advantage * log_prob(completion)]
+```
+
+Where the advantage is computed relative to other completions in the same group, eliminating the need for a baseline/critic network.
+
+## Why This Architecture?
+
+Traditional RL training runs everything on a single GPU, which creates bottlenecks:
+- **Generation is slow** on training GPUs (not optimized for inference)
+- **Reward computation blocks training** while waiting for evaluations
+- **No horizontal scaling** - can't add more inference capacity
+
+This framework solves these problems with a **distributed, serverless architecture**:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                           MODAL CLOUD                                   │
 │                                                                         │
 │  ┌───────────────────────────────────────────────────────────────────┐ │
-│  │                    Orchestrator                                    │ │
-│  │                    (@app.function, CPU)                           │ │
-│  │  • Loads data, coordinates workers, manages training loop         │ │
+│  │                    Orchestrator (CPU)                              │ │
+│  │  • Loads dataset and manages training loop                        │ │
+│  │  • Coordinates all workers                                        │ │
+│  │  • Logs metrics to Weights & Biases                               │ │
 │  └───────────────────────┬───────────────────────────────────────────┘ │
 │                          │                                              │
 │          ┌───────────────┼───────────────┬───────────────┐             │
 │          ▼               ▼               ▼               ▼             │
 │  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌──────────┐      │
 │  │ ActorWorker  │ │RolloutWorker │ │RolloutWorker │ │ Reward   │      │
-│  │ (H100, TRL)  │ │ (A10G, vLLM) │ │ (A10G, vLLM) │ │ Workers  │      │
-│  │ GRPOTrainer  │ │ Generation   │ │ Generation   │ │(Sandbox) │      │
+│  │   (A100)     │ │   (A10G)     │ │   (A10G)     │ │ Workers  │      │
+│  │ TRL Trainer  │ │    vLLM      │ │    vLLM      │ │(Sandbox) │      │
 │  └──────────────┘ └──────────────┘ └──────────────┘ └──────────┘      │
 │                                                                         │
 │  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │                     Single Modal Volume                          │   │
-│  │  /storage/checkpoints  /storage/data  /storage/hf_cache         │   │
+│  │                   Shared Modal Volume                            │   │
+│  │  /storage/checkpoints    /storage/hf_cache                      │   │
 │  └─────────────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Training Loop
+**Benefits:**
+- **Parallel generation**: Multiple vLLM workers generate completions simultaneously
+- **Fast inference**: vLLM is optimized for inference (continuous batching, PagedAttention)
+- **Secure execution**: Code runs in isolated Modal Sandboxes
+- **Serverless scaling**: Pay only for compute you use, scale to zero when idle
+- **Checkpoint-based sync**: Weights are synced via shared volume (efficient for large models)
+
+## Quick Start
+
+### Prerequisites
+
+1. **Install Modal CLI:**
+   ```bash
+   pip install modal
+   modal setup  # Authenticate with Modal
+   ```
+
+2. **Create Modal secrets** (for HuggingFace and Weights & Biases):
+   ```bash
+   modal secret create hf-wandb-secret \
+     HF_TOKEN=<your-huggingface-token> \
+     WANDB_API_KEY=<your-wandb-key>
+   ```
+
+   > **Note:** Update the secret name in `app.py` if you use a different name.
+
+3. **Create the storage volume:**
+   ```bash
+   modal volume create grpo-trl-storage
+   ```
+
+### Run Training
+
+```bash
+# Basic training run
+modal run MRL/train.py
+
+# With custom parameters
+modal run MRL/train.py \
+  --max-samples 100 \
+  --max-steps 10 \
+  --batch-size 4 \
+  --num-rollout-workers 2 \
+  --num-generations 2 \
+  --max-tokens 1024 \
+  --max-model-len 4096 \
+  --sync-weights-every 5
+
+# Run in background (detached)
+modal run --detach MRL/train.py
+```
+
+### Monitor Training
+
+- **Modal Dashboard**: https://modal.com/apps - View logs, costs, GPU usage
+- **Weights & Biases**: Training metrics logged to project `modal-grpo-trl`
+
+## How It Works: Step by Step
+
+### The Training Loop
+
+Each training step follows this flow:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -47,306 +123,408 @@ The architecture is inspired by [veRL](https://github.com/volcengine/verl) and d
 │                                                                      │
 │  1. GET BATCH                                                        │
 │     Orchestrator fetches batch of prompts from dataset               │
+│     Example: 4 coding problems                                       │
 │                          │                                           │
 │                          ▼                                           │
 │  2. GENERATE COMPLETIONS (Parallel)                                  │
-│     ┌─────────────┐ ┌─────────────┐ ┌─────────────┐                 │
-│     │ RolloutWorker│ │RolloutWorker│ │RolloutWorker│                │
-│     │   Chunk 1   │ │   Chunk 2   │ │   Chunk N   │                 │
-│     └──────┬──────┘ └──────┬──────┘ └──────┬──────┘                 │
-│            └───────────────┼───────────────┘                         │
-│                            ▼                                         │
+│     Each prompt is sent to rollout workers                           │
+│     With num_generations=2, we get 8 completions total               │
+│     ┌─────────────┐ ┌─────────────┐                                 │
+│     │RolloutWorker│ │RolloutWorker│                                 │
+│     │  4 prompts  │ │  4 prompts  │                                 │
+│     │  → 4 codes  │ │  → 4 codes  │                                 │
+│     └──────┬──────┘ └──────┬──────┘                                 │
+│            └───────┬───────┘                                         │
+│                    ▼                                                 │
 │  3. COMPUTE REWARDS (Parallel via Sandboxes)                         │
+│     Each completion is executed against test cases                   │
+│     Reward = 1 if all tests pass, 0 otherwise                        │
 │     ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐                 │
-│     │Sandbox 1│ │Sandbox 2│ │Sandbox 3│ │Sandbox N│                 │
-│     │ Code 1  │ │ Code 2  │ │ Code 3  │ │ Code N  │                 │
+│     │Sandbox 1│ │Sandbox 2│ │   ...   │ │Sandbox 8│                 │
+│     │ Code 1  │ │ Code 2  │ │         │ │ Code 8  │                 │
+│     │ r=1     │ │ r=0     │ │         │ │ r=1     │                 │
 │     └────┬────┘ └────┬────┘ └────┬────┘ └────┬────┘                 │
-│          └───────────┼───────────┼───────────┘                       │
-│                      ▼                                               │
+│          └───────────┴───────────┴───────────┘                       │
+│                          │                                           │
+│                          ▼                                           │
 │  4. TRAIN STEP                                                       │
-│     ActorWorker computes GRPO loss and updates policy                │
-│                      │                                               │
-│                      ▼                                               │
-│  5. SYNC WEIGHTS (Periodic)                                          │
-│     Actor → RolloutWorkers (every N steps)                           │
-│                      │                                               │
-│                      ▼                                               │
-│  6. CHECKPOINT (Periodic)                                            │
-│     Save to /storage/checkpoints/step-N                              │
+│     ActorWorker receives (prompts, completions, rewards)             │
+│     Computes GRPO loss and updates model weights                     │
+│     Loss = -mean(reward * log_prob(completion))                      │
+│                          │                                           │
+│                          ▼                                           │
+│  5. SYNC WEIGHTS (Every N steps)                                     │
+│     Actor saves checkpoint to shared volume                          │
+│     RolloutWorkers reload model from checkpoint                      │
+│     Now generating with updated policy!                              │
+│                          │                                           │
+│                          ▼                                           │
+│  6. REPEAT until max_steps reached                                   │
 │                                                                      │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-## Components
+### Example: Training on Code Generation
+
+The default dataset is `OpenCoder-LLM/opc-sft-stage2` with coding problems:
+
+**Input prompt:**
+```
+Write a Python function to check if a number is prime.
+```
+
+**Model generates multiple completions:**
+```python
+# Completion 1 (reward=1, passes tests)
+def is_prime(n):
+    if n < 2:
+        return False
+    for i in range(2, int(n**0.5) + 1):
+        if n % i == 0:
+            return False
+    return True
+
+# Completion 2 (reward=0, fails tests)
+def is_prime(n):
+    return n > 1  # Too simple, fails edge cases
+```
+
+**Test cases executed in sandboxes:**
+```python
+assert is_prime(2) == True
+assert is_prime(4) == False
+assert is_prime(17) == True
+assert is_prime(1) == False
+```
+
+**GRPO Update:**
+- Completion 1 gets positive advantage (reward above group mean)
+- Completion 2 gets negative advantage (reward below group mean)
+- Model learns to generate code more like Completion 1
+
+## Project Structure
+
+```
+MRL/
+├── __init__.py          # Package exports
+├── app.py               # Modal app, images, and volume definitions
+├── config.py            # Configuration dataclasses
+├── orchestrator.py      # Main training loop coordinator
+├── train.py             # CLI entry point
+└── workers/
+    ├── __init__.py      # Worker exports
+    ├── actor.py         # ActorWorker - TRL GRPOTrainer
+    ├── rollout.py       # RolloutWorker - vLLM inference
+    └── reward.py        # Reward computation via Sandboxes
+```
+
+## Components in Detail
 
 ### 1. ActorWorker (`workers/actor.py`)
 
-The training worker using TRL's GRPOTrainer.
+The training worker that updates model weights using TRL's GRPOTrainer.
 
 | Property | Value |
 |----------|-------|
-| GPU | H100 |
-| Image | NVIDIA CUDA 12.8.0 + TRL |
+| GPU | A100 (configurable) |
+| Framework | TRL GRPOTrainer |
 | Role | Policy optimization |
 
+**What it does:**
+1. Loads the base model (e.g., Qwen2-0.5B-Instruct)
+2. Receives (prompts, completions, rewards) from orchestrator
+3. Computes GRPO loss: `loss = -mean(rewards * log_probs)`
+4. Updates model weights via backpropagation
+5. Saves checkpoints to shared volume
+
 **Key Methods:**
-- `initialize(config)` - Set up GRPOTrainer with configuration
-- `train_step(prompts, completions, rewards, logprobs)` - Single training step
-- `train_full()` - Run TRL's built-in training loop
-- `get_weights()` - Serialize model weights for sync
-- `save_checkpoint(step)` - Save checkpoint to volume
+```python
+# Initialize the trainer
+actor.initialize(config)
+
+# Single training step with pre-computed data
+actor.train_step(prompts, completions, rewards, logprobs)
+
+# Save checkpoint for weight sync
+actor.save_checkpoint(step)
+```
 
 ### 2. RolloutWorker (`workers/rollout.py`)
 
-Standalone vLLM inference worker for fast generation.
+Fast inference worker using standalone vLLM for generation.
 
 | Property | Value |
 |----------|-------|
-| GPU | A10G |
-| Image | NVIDIA CUDA 12.8.1 + vLLM |
-| Concurrency | 32 concurrent inputs |
+| GPU | A10G (24GB) |
+| Framework | vLLM |
 | Idle Timeout | 300s (stays warm) |
 
+**What it does:**
+1. Loads model into vLLM engine (optimized for inference)
+2. Generates completions for batches of prompts
+3. Returns completions with log probabilities
+4. Reloads from checkpoints when weights are synced
+
+**Why vLLM?**
+- **Continuous batching**: Processes multiple requests efficiently
+- **PagedAttention**: Better memory management
+- **3-5x faster** than naive HuggingFace generation
+
 **Key Methods:**
-- `generate(prompts, model_path, ...)` - Generate completions with logprobs
-- `reload_from_checkpoint(path)` - Load updated weights from volume
-- `update_weights(bytes)` - Update weights from serialized state dict
-- `compute_logprobs(prompts, completions)` - Compute logprobs for given pairs
+```python
+# Generate completions
+result = rollout.generate(
+    prompts=["Write a function..."],
+    model_path="Qwen/Qwen2-0.5B-Instruct",
+    max_tokens=1024,
+    temperature=0.7
+)
+# Returns: {"completions": [...], "logprobs": [...]}
+
+# Reload after weight sync
+rollout.reload_from_checkpoint("/storage/checkpoints/step-5")
+```
 
 ### 3. Reward Workers (`workers/reward.py`)
 
-Code execution in secure Modal Sandboxes.
+Secure code execution in Modal Sandboxes.
 
 | Property | Value |
 |----------|-------|
-| Execution | Modal Sandbox |
+| Execution | Modal Sandbox (isolated) |
 | Timeout | 30s per execution |
-| Parallelism | Via `starmap()` |
+| Security | No network, limited filesystem |
+
+**What it does:**
+1. Extracts code from model completion (handles ```python blocks)
+2. Combines code with test cases
+3. Executes in isolated sandbox
+4. Returns reward: 1 if all tests pass, 0 otherwise
+
+**Why Sandboxes?**
+- **Security**: Untrusted code runs in isolation
+- **Parallelism**: Each execution is independent
+- **No side effects**: Clean environment for each test
 
 **Key Functions:**
-- `compute_reward(completion, testcase)` - Binary reward (0 or 1)
-- `compute_reward_with_partial_credit(completion, testcase)` - Partial credit (0 to 1)
-- `reward_helper_function(completions, testcases)` - TRL-compatible batch function
+```python
+# Binary reward (pass/fail)
+reward = compute_reward(completion, testcases)  # Returns 0 or 1
+
+# Partial credit (proportion of tests passed)
+reward = compute_reward_with_partial_credit(completion, testcases)  # Returns 0.0-1.0
+
+# TRL-compatible batch function
+rewards = reward_helper_function(completions, testcases)  # Returns list
+```
 
 ### 4. Orchestrator (`orchestrator.py`)
 
 Coordinates all workers in the training loop.
 
-**Functions:**
-- `train(config)` - veRL-style distributed training with manual orchestration
-- `train_simple(config)` - TRL's built-in training loop (simpler, less control)
+**What it does:**
+1. Loads dataset and initializes workers
+2. For each training step:
+   - Fetches batch of prompts
+   - Distributes generation across rollout workers
+   - Collects completions and computes rewards
+   - Sends data to actor for training
+   - Periodically syncs weights to rollout workers
+3. Logs metrics to Weights & Biases
+4. Saves final checkpoint
 
 ## Configuration
-
-### OrchestratorConfig
-
-```python
-from modal_grpo.config import OrchestratorConfig
-
-config = OrchestratorConfig(
-    model=ModelConfig(
-        model_name="Qwen/Qwen2-0.5B-Instruct",
-        max_model_len=4096,
-        trust_remote_code=True,
-    ),
-    training=TrainingConfig(
-        num_epochs=5,
-        max_steps=-1,  # -1 for unlimited
-        batch_size=8,
-        learning_rate=5e-6,
-        num_generations=4,  # Generations per prompt for GRPO
-        save_steps=100,
-        sync_weights_every=1,
-    ),
-    generation=GenerationConfig(
-        max_tokens=512,
-        temperature=0.7,
-        top_p=0.9,
-    ),
-    num_rollout_workers=2,
-    dataset_name="OpenCoder-LLM/opc-sft-stage2",
-    dataset_config="educational_instruct",
-    max_samples=128,  # None for full dataset
-)
-```
 
 ### CLI Arguments
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `--model` | `Qwen/Qwen2-0.5B-Instruct` | Model name or path |
+| `--model` | `Qwen/Qwen2-0.5B-Instruct` | HuggingFace model name |
 | `--epochs` | 5 | Number of training epochs |
-| `--max-steps` | 5 | Maximum steps (-1 for unlimited) |
-| `--batch-size` | 8 | Batch size |
+| `--max-steps` | 5 | Maximum training steps (-1 for unlimited) |
+| `--batch-size` | 8 | Prompts per training step |
 | `--num-rollout-workers` | 2 | Number of vLLM workers |
-| `--num-generations` | 4 | Generations per prompt |
+| `--num-generations` | 4 | Completions per prompt |
 | `--max-samples` | 128 | Dataset samples (0 for full) |
+| `--max-tokens` | 8000 | Max tokens per completion |
+| `--max-model-len` | 16384 | Model context length |
 | `--learning-rate` | 5e-6 | Learning rate |
 | `--save-steps` | 100 | Checkpoint frequency |
 | `--sync-weights-every` | 1 | Weight sync frequency |
 | `--simple-mode` | False | Use TRL's built-in loop |
 
-## Usage
+### Recommended Configurations
 
-### Prerequisites
-
-1. Install Modal CLI:
-   ```bash
-   pip install modal
-   modal setup
-   ```
-
-2. Create HuggingFace/WandB secret:
-   ```bash
-   modal secret create adithya-hf-wandb \
-     HF_TOKEN=<your-token> \
-     WANDB_API_KEY=<your-key>
-   ```
-
-3. Create the storage volume:
-   ```bash
-   modal volume create grpo-trl-storage
-   ```
-
-### Running Training
-
+**Quick test run:**
 ```bash
-# Default training (orchestrator mode)
-modal run modal_grpo/train.py
+modal run MRL/train.py \
+  --max-samples 50 \
+  --max-steps 5 \
+  --batch-size 4 \
+  --num-generations 2 \
+  --sync-weights-every 100  # Disable sync for speed
+```
 
-# With custom parameters
-modal run modal_grpo/train.py \
-  --model "Qwen/Qwen2-0.5B-Instruct" \
-  --epochs 5 \
-  --max-steps 100 \
+**Full training run:**
+```bash
+modal run MRL/train.py \
+  --max-samples 0 \           # Full dataset
+  --max-steps 1000 \
   --batch-size 8 \
-  --num-rollout-workers 4
-
-# Simple mode (TRL built-in trainer)
-modal run modal_grpo/train.py --simple-mode
-
-# Run in background (detached)
-modal run --detach modal_grpo/train.py
+  --num-rollout-workers 4 \   # More parallel generation
+  --num-generations 4 \
+  --sync-weights-every 10     # Sync every 10 steps
 ```
-
-### Testing Components
-
-```bash
-# Test rollout worker
-modal run modal_grpo/train.py::test_rollout_fn
-
-# Test reward computation
-modal run modal_grpo/train.py::test_reward_fn
-
-# List checkpoints
-modal run modal_grpo/train.py::list_checkpoints_fn
-
-# Check volume contents
-modal volume ls grpo-trl-storage
-```
-
-### Monitoring
-
-- **Modal Dashboard**: [modal.com/apps](https://modal.com/apps) - View logs, costs, GPU usage
-- **Weights & Biases**: Training metrics logged to wandb project `modal-grpo-trl`
-
-## Images
-
-### Training Image (TRAINING_IMAGE)
-
-Base: `nvidia/cuda:12.8.0-devel-ubuntu24.04`
-
-Packages:
-- TRL (local installation from `/opt/trl`)
-- vLLM (via TRL extras)
-- wandb, datasets, accelerate, peft, bitsandbytes
-- hf_transfer for fast downloads
-
-### vLLM Image (VLLM_IMAGE)
-
-Base: `nvidia/cuda:12.8.1-devel-ubuntu24.04`
-
-Packages:
-- vLLM
-- flash-attn
-- TRL (for compatibility)
-- hf_transfer
-
-Environment:
-- `VLLM_USE_V1=0` (use v0 engine for stability)
 
 ## Volume Structure
+
+All persistent data is stored on a shared Modal volume:
 
 ```
 /storage/
 ├── checkpoints/
-│   ├── step-100/
-│   ├── step-200/
+│   ├── step-5/           # Checkpoint at step 5
+│   │   ├── config.json
+│   │   ├── model.safetensors
+│   │   └── tokenizer files...
+│   ├── step-10/
 │   └── ...
-├── data/
-│   └── (cached datasets)
-└── hf_cache/
-    └── (HuggingFace model cache)
+└── hf_cache/             # HuggingFace model cache
+    └── hub/
+        └── models--Qwen--Qwen2-0.5B-Instruct/
 ```
 
-## Comparison with Original `modal_trl.py`
-
-| Aspect | Original | Modal GRPO |
-|--------|----------|------------|
-| TRL Installation | `pip install trl==0.19.1` | Local dir from `/trl/` |
-| Base Image | `debian_slim` | NVIDIA CUDA devel |
-| Volumes | 1 checkpoint volume | 1 unified volume |
-| Architecture | Monolithic trainer | Separate workers |
-| Weight Sync | TRL internal | Explicit via Modal |
-| vLLM | TRL's built-in | Separate RolloutWorker |
-| Scaling | Single function | Horizontal rollout scaling |
-
-## GRPO Algorithm
-
-GRPO (Group Relative Policy Optimization) is a reinforcement learning algorithm introduced by DeepSeek. The key idea is to:
-
-1. Generate multiple completions per prompt
-2. Compute rewards for each completion
-3. Use relative rewards within the group to compute advantages
-4. Update the policy to increase probability of higher-reward completions
-
-Loss function:
-```
-L = -E[advantage * log_prob(completion)]
+**Inspect volume contents:**
+```bash
+modal volume ls grpo-trl-storage
+modal volume ls grpo-trl-storage checkpoints/
 ```
 
-Where advantage is computed relative to other completions in the same group.
+## Testing Individual Components
+
+```bash
+# Test rollout worker generation
+modal run MRL/train.py::test_rollout_fn
+
+# Test reward computation
+modal run MRL/train.py::test_reward_fn
+
+# List saved checkpoints
+modal run MRL/train.py::list_checkpoints_fn
+```
 
 ## Troubleshooting
 
-### Image Build Failures
+### Out of Memory (OOM)
 
-```bash
-# Check image build logs
-modal run modal_grpo/app.py
-```
+**Symptoms:** CUDA OOM errors during training or generation
 
-### Out of Memory
-
-- Reduce `batch_size`
-- Reduce `max_model_len`
-- Use gradient checkpointing (enabled by default)
+**Solutions:**
+- Reduce `--batch-size`
+- Reduce `--max-model-len`
+- Reduce `--num-generations`
+- Use a smaller model
 
 ### Slow Generation
 
-- Increase `num_rollout_workers`
-- Check GPU utilization in Modal dashboard
-- Consider using larger GPUs (A100 instead of A10G)
+**Symptoms:** Long wait times during completion generation
+
+**Solutions:**
+- Increase `--num-rollout-workers` (more parallel generation)
+- Reduce `--max-tokens` (shorter completions)
+- Check Modal dashboard for GPU utilization
 
 ### Weight Sync Issues
 
-vLLM doesn't support direct weight updates, so weights are synced via:
-1. Serialize actor weights
-2. Save to temp location
-3. Reload vLLM engine
+**Symptoms:** Rollout workers using stale weights
 
-For production, consider using a shared filesystem or implementing custom weight update mechanism.
+**How weight sync works:**
+1. Actor saves checkpoint to `/storage/checkpoints/step-N`
+2. Rollout workers call `volume.reload()` to get latest files
+3. vLLM reloads model from checkpoint
+
+**Debug:**
+```bash
+# Check if checkpoints exist
+modal volume ls grpo-trl-storage checkpoints/
+```
+
+### Low Rewards
+
+**Symptoms:** Mean reward stays at 0 or very low
+
+**Possible causes:**
+- Model too small for the task
+- Prompts too difficult
+- Test cases too strict
+- Temperature too low (not enough exploration)
+
+**Solutions:**
+- Try a larger model
+- Use `--max-samples` to filter easier examples
+- Increase `--temperature` (default 0.7)
+- Use partial credit rewards
+
+## Cost Estimation
+
+Modal pricing (approximate, check modal.com for current rates):
+
+| Resource | Cost | Usage |
+|----------|------|-------|
+| A100 GPU | ~$2.50/hr | Actor training |
+| A10G GPU | ~$1.10/hr | Rollout workers (x2) |
+| CPU | ~$0.10/hr | Orchestrator |
+| Sandbox | ~$0.001/exec | Reward computation |
+
+**Example 10-step training run:**
+- Duration: ~8-10 minutes
+- Estimated cost: ~$0.50-1.00
+
+## Advanced: Customization
+
+### Using a Different Dataset
+
+Modify `orchestrator.py` or create a custom config:
+
+```python
+config = {
+    "dataset_name": "your-org/your-dataset",
+    "dataset_config": "default",
+    "dataset_split": "train",
+}
+```
+
+Dataset must have columns that map to:
+- `prompt` (or rename via `dataset.rename_column()`)
+- `testcases` (list of assert statements)
+
+### Custom Reward Function
+
+Modify `workers/reward.py`:
+
+```python
+def custom_reward(completion: str, metadata: dict) -> float:
+    # Your custom logic here
+    # Return float between 0 and 1
+    pass
+```
+
+### Different Model
+
+```bash
+modal run MRL/train.py --model "meta-llama/Llama-2-7b-chat-hf"
+```
+
+Note: Larger models require more GPU memory. Adjust `--max-model-len` accordingly.
+
+## References
+
+- [GRPO Paper (DeepSeek)](https://arxiv.org/abs/2402.03300) - Original algorithm
+- [TRL Documentation](https://huggingface.co/docs/trl) - Training library
+- [vLLM Documentation](https://docs.vllm.ai) - Inference engine
+- [Modal Documentation](https://modal.com/docs) - Serverless platform
+- [veRL](https://github.com/volcengine/verl) - Inspiration for architecture
 
 ## License
 
-MIT License - see repository root for details.
+MIT License
