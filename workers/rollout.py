@@ -6,8 +6,12 @@ import modal
 
 # Import app and resources from the shared app module
 from MRL.app import app, volume, VLLM_IMAGE
+from MRL.logging_config import get_logger
 
 STORAGE_PATH = "/storage"
+
+# Module logger
+logger = get_logger("rollout")
 
 
 @app.cls(
@@ -52,7 +56,7 @@ class RolloutWorker:
         self._current_sync_id = None
         # Local model path for efficient reload_weights
         self._local_model_path = None
-        print("RolloutWorker container started (lazy vLLM init, v1 engine enabled)")
+        logger.info("RolloutWorker container started (lazy vLLM init, v1 engine enabled)")
 
     def _load_model(
         self,
@@ -75,11 +79,11 @@ class RolloutWorker:
 
         # Clean up existing model
         if self.llm is not None:
-            print(f"Unloading current model: {self.current_model_path}")
+            logger.info(f"Unloading current model: {self.current_model_path}")
             del self.llm
             torch.cuda.empty_cache()
 
-        print(f"Loading model: {model_path}")
+        logger.info(f"Loading model: {model_path}")
         self.llm = LLM(
             model=model_path,
             gpu_memory_utilization=gpu_memory_utilization,
@@ -87,7 +91,7 @@ class RolloutWorker:
             enforce_eager=True,  # Disable CUDA graphs for stability
         )
         self.current_model_path = model_path
-        print(f"Model loaded successfully: {model_path}")
+        logger.info(f"Model loaded successfully: {model_path}")
 
     @modal.method()
     def generate(
@@ -126,7 +130,7 @@ class RolloutWorker:
             logprobs=1,  # Return top-1 logprob for each token
         )
 
-        print(f"Generating {len(prompts)} prompts with n={n}...")
+        logger.info(f"Generating {len(prompts)} prompts with n={n}...")
         outputs = self.llm.generate(prompts, sampling_params)
 
         # Process outputs
@@ -150,7 +154,7 @@ class RolloutWorker:
                 else:
                     all_logprobs.append([])
 
-        print(f"Generated {len(completions)} completions")
+        logger.info(f"Generated {len(completions)} completions")
         return {
             "completions": completions,
             "logprobs": all_logprobs,
@@ -169,7 +173,7 @@ class RolloutWorker:
         """
         import torch
 
-        print(f"Reloading from checkpoint: {checkpoint_path}")
+        logger.info(f"Reloading from checkpoint: {checkpoint_path}")
 
         # Free GPU memory first
         if self.llm is not None:
@@ -220,7 +224,7 @@ class RolloutWorker:
         model_name_safe = base_model.replace("/", "_")
         local_path = f"{STORAGE_PATH}/model_cache/{model_name_safe}"
 
-        print(f"Initializing model at local path: {local_path}")
+        logger.info(f"Initializing model at local path: {local_path}")
 
         # Check if we already have this model cached
         need_download = False
@@ -235,19 +239,18 @@ class RolloutWorker:
                     with safe_open(safetensors_path, framework="pt") as f:
                         keys = list(f.keys())[:5]
                         if any("base_model" in k or "lora_" in k for k in keys):
-                            print(f"  ⚠ Cached model has corrupted weights (LoRA artifacts)")
-                            print(f"  Clearing cache and re-downloading...")
-                            import shutil
+                            logger.warning("Cached model has corrupted weights (LoRA artifacts)")
+                            logger.info("Clearing cache and re-downloading...")
                             shutil.rmtree(local_path)
                             need_download = True
                 except Exception as e:
-                    print(f"  Warning: Could not validate cache ({e}), using as-is")
+                    logger.warning(f"Could not validate cache ({e}), using as-is")
                     volume.reload()
             else:
                 volume.reload()
 
         if need_download:
-            print(f"  Downloading {base_model} to volume...")
+            logger.info(f"Downloading {base_model} to volume...")
             os.makedirs(local_path, exist_ok=True)
 
             # Download model files
@@ -256,10 +259,10 @@ class RolloutWorker:
                 local_dir=local_path,
                 ignore_patterns=["*.md", "*.txt", ".git*"],
             )
-            print(f"  Model cached at {local_path}")
+            logger.info(f"Model cached at {local_path}")
             volume.commit()
         elif os.path.exists(local_path):
-            print(f"  Using cached model at {local_path}")
+            logger.info(f"Using cached model at {local_path}")
 
         # Free GPU memory if model exists
         if self.llm is not None:
@@ -268,7 +271,7 @@ class RolloutWorker:
             torch.cuda.empty_cache()
 
         # Initialize vLLM with local path
-        print(f"  Loading vLLM from {local_path}...")
+        logger.info(f"Loading vLLM from {local_path}...")
         self.llm = LLM(
             model=local_path,
             gpu_memory_utilization=gpu_memory_utilization,
@@ -281,7 +284,7 @@ class RolloutWorker:
         self._local_model_path = local_path
         self._cached_base_model = base_model
 
-        print(f"Model initialized for weight sync at {local_path}")
+        logger.info(f"Model initialized for weight sync at {local_path}")
         return local_path
 
     @modal.method()
@@ -306,7 +309,7 @@ class RolloutWorker:
         import time
 
         if self.llm is None or self._local_model_path is None:
-            print("Error: Model not initialized. Call initialize_for_weight_sync first.")
+            logger.error("Model not initialized. Call initialize_for_weight_sync first.")
             return False
 
         start_time = time.time()
@@ -318,15 +321,15 @@ class RolloutWorker:
         # Check weights file exists
         weights_file = f"{model_path}/model.safetensors"
         if not os.path.exists(weights_file):
-            print(f"Error: Weights file not found at {weights_file}")
+            logger.error(f"Weights file not found at {weights_file}")
             return False
 
-        print(f"Updating weights via reload_weights (no model recreation)...")
+        logger.info("Updating weights via reload_weights (no model recreation)...")
 
         try:
             if self._is_vllm_v1():
                 # v1 engine: use sleep/wake_up for efficient memory management
-                print("  Using vLLM v1 sleep/wake_up pattern...")
+                logger.info("Using vLLM v1 sleep/wake_up pattern...")
 
                 # Sleep to free GPU memory (level=2: discard weights and KV cache)
                 self.llm.sleep(level=2)
@@ -341,25 +344,68 @@ class RolloutWorker:
                 self.llm.wake_up(tags=["kv_cache"])
 
                 elapsed = time.time() - start_time
-                print(f"  Weights updated in {elapsed:.2f}s (efficient reload)")
+                logger.info(f"Weights updated in {elapsed:.2f}s (efficient reload)")
                 return True
             else:
                 # v0 engine: need to recreate model
-                print("  vLLM v0 detected, using full model reload...")
+                logger.info("vLLM v0 detected, using full model reload...")
                 import torch
                 del self.llm
                 self.llm = None
                 torch.cuda.empty_cache()
                 self._load_model(model_path)
                 elapsed = time.time() - start_time
-                print(f"  Weights updated in {elapsed:.2f}s (full reload)")
+                logger.info(f"Weights updated in {elapsed:.2f}s (full reload)")
                 return True
 
         except Exception as e:
-            print(f"Error updating weights: {e}")
+            logger.error(f"Error updating weights: {e}")
             import traceback
             traceback.print_exc()
             return False
+
+    def _validate_manifest(self, manifest_path: str) -> Optional[dict]:
+        """Validate and parse sync manifest file (Bug 3 fix).
+
+        Args:
+            manifest_path: Path to manifest.json
+
+        Returns:
+            Parsed manifest dict if valid, None otherwise
+        """
+        import json
+        import os
+
+        if not os.path.exists(manifest_path):
+            logger.warning(f"Manifest file not found at {manifest_path}")
+            return None
+
+        try:
+            with open(manifest_path) as f:
+                manifest = json.load(f)
+
+            # Validate required fields
+            required_fields = ["sync_id", "weights_path"]
+            for field in required_fields:
+                if field not in manifest:
+                    logger.warning(f"Manifest missing required field: {field}")
+                    return None
+
+            # Validate weights file exists
+            if not os.path.exists(manifest["weights_path"]):
+                logger.warning(
+                    f"Manifest references non-existent weights: {manifest['weights_path']}"
+                )
+                return None
+
+            return manifest
+
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse manifest: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Error reading manifest: {e}")
+            return None
 
     @modal.method()
     def load_from_weight_sync(
@@ -399,27 +445,27 @@ class RolloutWorker:
         manifest_path = f"{sync_dir}/manifest.json"
 
         if not os.path.exists(weights_path):
-            print(f"Warning: No weights found at {weights_path}")
+            logger.warning(f"No weights found at {weights_path}")
             return False
 
-        # Read manifest
-        sync_id = None
-        if os.path.exists(manifest_path):
-            with open(manifest_path) as f:
-                manifest = json.load(f)
-                sync_id = manifest.get("sync_id")
+        # Bug 3 Fix: Validate manifest properly
+        manifest = self._validate_manifest(manifest_path)
+        sync_id = manifest.get("sync_id") if manifest else None
+
+        if manifest is None:
+            logger.warning("Manifest validation failed, proceeding with caution")
 
         # Check if we need to reload (same sync_id means no change)
         if sync_id is not None and sync_id == self._current_sync_id:
-            print(f"Weights already at sync_id {sync_id}, skipping reload")
+            logger.info(f"Weights already at sync_id {sync_id}, skipping reload")
             return True
 
-        print(f"Loading weights from {weights_path} (sync_id: {sync_id})")
+        logger.info(f"Loading weights from {weights_path} (sync_id: {sync_id})")
 
         # Ensure we have config/tokenizer cached
         config_cache_dir = f"{sync_dir}/config_cache"
         if self._cached_base_model != base_model or not os.path.exists(config_cache_dir):
-            print(f"Caching config/tokenizer from {base_model}...")
+            logger.info(f"Caching config/tokenizer from {base_model}...")
             os.makedirs(config_cache_dir, exist_ok=True)
 
             config = AutoConfig.from_pretrained(base_model, trust_remote_code=True)
@@ -451,7 +497,7 @@ class RolloutWorker:
 
         self.current_model_path = config_cache_dir
         self._current_sync_id = sync_id
-        print(f"Model loaded from weight sync (sync_id: {sync_id})")
+        logger.info(f"Model loaded from weight sync (sync_id: {sync_id})")
         return True
 
     @modal.method()
@@ -473,10 +519,10 @@ class RolloutWorker:
         from safetensors.torch import save_file
 
         if self.llm is None:
-            print("Warning: No model loaded, cannot update weights")
+            logger.warning("No model loaded, cannot update weights")
             return False
 
-        print("Updating model weights from actor (disk-based)...")
+        logger.info("Updating model weights from actor (disk-based)...")
 
         # First, free GPU memory by deleting vLLM engine
         original_model_path = self.current_model_path
@@ -508,8 +554,8 @@ class RolloutWorker:
             tokenizer = AutoTokenizer.from_pretrained(original_model_path)
             tokenizer.save_pretrained(temp_path)
         except Exception as e:
-            print(f"Warning: Could not copy config/tokenizer: {e}")
-            print("Falling back to original model path for reload")
+            logger.warning(f"Could not copy config/tokenizer: {e}")
+            logger.info("Falling back to original model path for reload")
             # Clean up and reload original model
             del state_dict
             torch.cuda.empty_cache()
@@ -522,7 +568,7 @@ class RolloutWorker:
 
         # Reload vLLM with updated weights
         self._load_model(temp_path)
-        print("Weights updated successfully")
+        logger.info("Weights updated successfully")
         return True
 
     def _is_vllm_v1(self) -> bool:
@@ -546,19 +592,32 @@ class RolloutWorker:
         Returns:
             True if update successful
         """
+        import gc
         import io
         import os
 
         import torch
         from safetensors.torch import save_file
 
-        print("Using disk-based weight update (fallback)...")
+        logger.info("Using disk-based weight update (fallback)...")
 
-        # First, free GPU memory by deleting vLLM engine
+        # First, free GPU memory by deleting vLLM engine completely
         original_model_path = self.current_model_path
-        del self.llm
-        self.llm = None
+
+        # Try to wake up if in sleep mode before deletion
+        if self.llm is not None:
+            try:
+                self.llm.wake_up()  # Wake up all components
+            except Exception:
+                pass  # Ignore errors, we're deleting anyway
+
+            del self.llm
+            self.llm = None
+
+        # Force garbage collection and GPU memory cleanup
+        gc.collect()
         torch.cuda.empty_cache()
+        torch.cuda.synchronize()
 
         # Load state dict to CPU
         buffer = io.BytesIO(weights_bytes)
@@ -579,17 +638,20 @@ class RolloutWorker:
             tokenizer = AutoTokenizer.from_pretrained(original_model_path)
             tokenizer.save_pretrained(temp_path)
         except Exception as e:
-            print(f"Warning: Could not copy config/tokenizer: {e}")
+            logger.warning(f"Could not copy config/tokenizer: {e}")
             del state_dict
             torch.cuda.empty_cache()
             self._load_model(original_model_path)
             return False
 
         del state_dict
+        gc.collect()
         torch.cuda.empty_cache()
+        torch.cuda.synchronize()
 
-        self._load_model(temp_path)
-        print("Weights updated via disk-based fallback")
+        # Load with slightly lower memory utilization to leave headroom
+        self._load_model(temp_path, gpu_memory_utilization=0.85)
+        logger.info("Weights updated via disk-based fallback")
         return True
 
     def _create_weights_iterator(self, state_dict: dict):
@@ -617,11 +679,10 @@ class RolloutWorker:
 
     @modal.method()
     def update_weights_direct(self, weights_bytes: bytes) -> bool:
-        """Update model weights directly in vLLM memory (no disk I/O).
+        """Update model weights from serialized bytes.
 
-        This is the optimal weight sync method. It uses:
-        - vLLM v1: collective_rpc("reload_weights") with sleep/wake_up for memory management
-        - vLLM v0: Direct model.load_weights() (deprecated but fallback)
+        For vLLM v1, this saves to a temp file and uses the efficient
+        sleep/wake_up/reload_weights pattern (same as reload strategy).
 
         Args:
             weights_bytes: Serialized state dict bytes (torch.save format)
@@ -630,15 +691,17 @@ class RolloutWorker:
             True if update successful
         """
         import io
+        import os
         import time
 
         import torch
+        from safetensors.torch import save_file
 
         if self.llm is None:
-            print("Warning: No model loaded, cannot update weights")
+            logger.warning("No model loaded, cannot update weights")
             return False
 
-        print("Updating model weights directly in vLLM...")
+        logger.info("Updating model weights from bytes...")
         start_time = time.time()
 
         # Load state dict to CPU first
@@ -646,35 +709,49 @@ class RolloutWorker:
         state_dict = torch.load(buffer, map_location="cpu", weights_only=True)
 
         try:
+            # For vLLM v1, we need to save to a file and use reload_weights
+            # because collective_rpc can't serialize generators/iterators
             if self._is_vllm_v1():
-                # vLLM v1: Use collective_rpc with sleep/wake_up pattern
-                print("  Using vLLM v1 API (collective_rpc + sleep/wake_up)")
+                logger.info("Using vLLM v1 API (file-based reload_weights)")
 
-                # Create weights iterator
-                def weights_iter():
-                    return self._create_weights_iterator(state_dict)
+                # Save weights to a temp file
+                temp_weights_path = f"{STORAGE_PATH}/direct_sync_weights"
+                os.makedirs(temp_weights_path, exist_ok=True)
+                weights_file = f"{temp_weights_path}/model.safetensors"
 
-                # Sleep to free GPU memory (level=2: discard weights and KV cache)
+                # Clean state dict for saving
+                clean_state_dict = {}
+                for name, param in state_dict.items():
+                    # Remove common prefixes
+                    fixed_name = name
+                    for prefix in ["_checkpoint_wrapped_module.", "module."]:
+                        if fixed_name.startswith(prefix):
+                            fixed_name = fixed_name[len(prefix):]
+                    clean_state_dict[fixed_name] = param.contiguous()
+
+                save_file(clean_state_dict, weights_file)
+                save_time = time.time() - start_time
+                logger.info(f"Weights saved to temp file in {save_time:.2f}s")
+
+                # Free state dict memory
+                del state_dict
+                del clean_state_dict
+                torch.cuda.empty_cache()
+
+                # Use efficient sleep/wake_up/reload_weights pattern
+                logger.info("Using vLLM v1 sleep/wake_up pattern...")
                 self.llm.sleep(level=2)
-
-                # Reallocate weights memory only
                 self.llm.wake_up(tags=["weights"])
-
-                # Load weights in-place via collective_rpc
-                self.llm.collective_rpc(
-                    "reload_weights",
-                    kwargs={"weights_iterator": weights_iter()}
-                )
-
-                # Reallocate KV cache
+                self.llm.llm_engine.model_executor.collective_rpc("reload_weights")
                 self.llm.wake_up(tags=["kv_cache"])
 
                 elapsed = time.time() - start_time
-                print(f"  Weights updated via v1 API in {elapsed:.2f}s (no disk I/O)")
+                logger.info(f"Weights updated via v1 API in {elapsed:.2f}s")
+                return True
 
             else:
                 # vLLM v0 (deprecated): Try direct model access
-                print("  Using vLLM v0 API (direct model access)")
+                logger.info("Using vLLM v0 API (direct model access)")
 
                 # Try different API paths for v0
                 llm_model = None
@@ -693,7 +770,7 @@ class RolloutWorker:
                         continue
 
                 if llm_model is None:
-                    print("  Warning: Could not access vLLM internal model")
+                    logger.warning("Could not access vLLM internal model")
                     raise RuntimeError("Cannot access vLLM model for weight update")
 
                 # Create weights list for load_weights
@@ -709,20 +786,26 @@ class RolloutWorker:
                     pass
 
                 elapsed = time.time() - start_time
-                print(f"  Weights updated via v0 API in {elapsed:.2f}s (no disk I/O)")
+                logger.info(f"Weights updated via v0 API in {elapsed:.2f}s")
 
-            # Clean up
-            del state_dict
-            torch.cuda.empty_cache()
-            return True
+                # Clean up
+                del state_dict
+                torch.cuda.empty_cache()
+                return True
 
         except Exception as e:
-            print(f"Warning: Direct weight update failed: {e}")
+            logger.warning(f"Direct weight update failed: {e}")
             import traceback
             traceback.print_exc()
-            print("Falling back to disk-based update")
-            del state_dict
+            logger.info("Falling back to disk-based update (full model reload)")
+
+            # Clean up before fallback
+            try:
+                del state_dict
+            except NameError:
+                pass
             torch.cuda.empty_cache()
+
             return self._do_disk_based_update(weights_bytes)
 
     @modal.method()
@@ -748,14 +831,14 @@ class RolloutWorker:
         import torch
 
         if self.llm is None:
-            print("Warning: No model loaded, cannot update weights")
+            logger.warning("No model loaded, cannot update weights")
             return False
 
         # Get vLLM's internal model
         try:
             llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
         except AttributeError as e:
-            print(f"Warning: Could not access vLLM internal model: {e}")
+            logger.warning(f"Could not access vLLM internal model: {e}")
             return False
 
         # Process this chunk
@@ -777,7 +860,7 @@ class RolloutWorker:
         try:
             llm_model.load_weights(weights_to_load)
         except Exception as e:
-            print(f"Warning: Failed to load weight chunk: {e}")
+            logger.warning(f"Failed to load weight chunk: {e}")
             return False
 
         # Clean up
@@ -790,7 +873,7 @@ class RolloutWorker:
                 self.llm.reset_prefix_cache()
             except AttributeError:
                 pass
-            print("Streamed weight update complete")
+            logger.info("Streamed weight update complete")
 
         return True
 

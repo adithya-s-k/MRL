@@ -1,16 +1,26 @@
 """Main training orchestrator - veRL style coordination of workers."""
 
+import time
 from typing import Optional
 
 import modal
 
 from MRL.app import app, volume, TRAINING_IMAGE
 from MRL.config import OrchestratorConfig
+from MRL.logging_config import get_logger
 from MRL.workers.actor import ActorWorker
 from MRL.workers.rollout import RolloutWorker
 from MRL.workers.reward import reward_helper_function
+from MRL.workers.weight_sync import get_weight_sync_strategy, WeightSyncResult
 
 STORAGE_PATH = "/storage"
+
+# Module logger
+logger = get_logger("orchestrator")
+
+# Constants for retry logic (Bug 7 fix)
+MAX_RETRIES = 3
+RETRY_DELAY_SECONDS = 5
 
 
 def get_batch(dataset, batch_idx: int, batch_size: int) -> dict:
@@ -60,13 +70,45 @@ def chunk_list(lst: list, num_chunks: int) -> list[list]:
     return [c for c in chunks if c]  # Remove empty chunks
 
 
+def retry_with_backoff(func, max_retries: int = MAX_RETRIES, delay: float = RETRY_DELAY_SECONDS):
+    """Execute a function with retry logic and exponential backoff (Bug 7 fix).
+
+    Args:
+        func: Callable to execute
+        max_retries: Maximum number of retry attempts
+        delay: Initial delay between retries (doubles each retry)
+
+    Returns:
+        Result of the function
+
+    Raises:
+        Last exception if all retries fail
+    """
+    last_exception = None
+    for attempt in range(max_retries):
+        try:
+            return func()
+        except Exception as e:
+            last_exception = e
+            if attempt < max_retries - 1:
+                wait_time = delay * (2 ** attempt)
+                logger.warning(
+                    f"Attempt {attempt + 1}/{max_retries} failed: {e}. "
+                    f"Retrying in {wait_time:.1f}s..."
+                )
+                time.sleep(wait_time)
+            else:
+                logger.error(f"All {max_retries} attempts failed. Last error: {e}")
+    raise last_exception
+
+
 @app.function(
     image=TRAINING_IMAGE,
     volumes={STORAGE_PATH: volume},
     timeout=3600 * 24,  # 24 hours
     secrets=[modal.Secret.from_name("adithya-hf-wandb")],
 )
-def train(config_dict: Optional[dict] = None):
+def train(config_dict: Optional[dict] = None, resume_from: Optional[str] = None):
     """Main training orchestrator - veRL style.
 
     Coordinates the training loop:
@@ -79,19 +121,44 @@ def train(config_dict: Optional[dict] = None):
 
     Args:
         config_dict: Configuration dictionary (optional, uses defaults if None)
+        resume_from: Optional path to checkpoint to resume from
 
     Returns:
         Training result summary
     """
+    import json
+    import os
+
     import wandb
     from datasets import load_dataset
 
     # Parse config
     if config_dict is None:
         config_dict = {}
+
+    # Load config from checkpoint if resuming
+    if resume_from is not None:
+        logger.info(f"Resuming from checkpoint: {resume_from}")
+        checkpoint_state_path = os.path.join(resume_from, "training_state.json")
+        if os.path.exists(checkpoint_state_path):
+            with open(checkpoint_state_path) as f:
+                checkpoint_state = json.load(f)
+            # Merge checkpoint config with provided config (provided takes precedence)
+            saved_config = checkpoint_state.get("config", {})
+            merged_config = saved_config.copy()
+            merged_config.update(config_dict)
+            config_dict = merged_config
+            resume_step = checkpoint_state.get("global_step", 0)
+            logger.info(f"Loaded checkpoint state, will resume from step {resume_step}")
+        else:
+            logger.warning(f"No training_state.json found in {resume_from}, starting from step 0")
+            resume_step = 0
+    else:
+        resume_step = 0
+
     config = OrchestratorConfig.from_dict(config_dict)
 
-    print(f"Starting training with config: {config.to_dict()}")
+    logger.info(f"Starting training with config: {config.to_dict()}")
 
     # Initialize wandb
     wandb.init(
@@ -101,7 +168,7 @@ def train(config_dict: Optional[dict] = None):
     )
 
     # Load dataset
-    print("Loading dataset...")
+    logger.info("Loading dataset...")
     dataset = load_dataset(
         config.dataset_name,
         config.dataset_config,
@@ -113,70 +180,68 @@ def train(config_dict: Optional[dict] = None):
     if config.max_samples:
         dataset = dataset.select(range(min(config.max_samples, len(dataset))))
 
-    print(f"Dataset loaded with {len(dataset)} samples")
+    logger.info(f"Dataset loaded with {len(dataset)} samples")
 
     # Initialize workers
-    print("Initializing workers...")
+    logger.info("Initializing workers...")
     actor = ActorWorker()
 
-    # Initialize actor
-    actor.initialize.remote(config.to_dict())
+    # Initialize actor (with checkpoint resumption if applicable)
+    if resume_from is not None:
+        logger.info(f"Loading actor from checkpoint: {resume_from}")
+        restored_state = actor.load_checkpoint.remote(resume_from, config.to_dict())
+        logger.info(f"Actor restored: {restored_state}")
+    else:
+        actor.initialize.remote(config.to_dict())
 
     # Create rollout workers
     rollout_workers = [RolloutWorker() for _ in range(config.num_rollout_workers)]
 
-    # Pre-warm rollout workers with appropriate initialization
+    # Initialize weight sync strategy
     sync_method = config.training.weight_sync_method
-    print(f"Pre-warming rollout workers (sync_method: {sync_method})...")
+    logger.info(f"Creating weight sync strategy: {sync_method}")
 
-    # Track model path for reload-based sync
-    rollout_model_path = None
+    weight_sync_strategy = get_weight_sync_strategy(
+        method=sync_method,
+        volume=volume,
+        config=config.to_dict(),
+    )
 
-    if sync_method == "reload":
-        # Initialize with local model path for efficient reload_weights
-        print("  Using efficient reload-based initialization...")
-        warmup_futures = []
-        for worker in rollout_workers:
-            future = worker.initialize_for_weight_sync.spawn(
+    # Validate strategy and log any warnings
+    strategy_warnings = weight_sync_strategy.validate()
+    for warning in strategy_warnings:
+        logger.warning(f"Weight sync strategy warning: {warning}")
+
+    # Initialize rollout workers using the strategy
+    logger.info(f"Initializing rollout workers with {weight_sync_strategy.name} strategy...")
+    rollout_model_path = weight_sync_strategy.initialize_workers(
+        rollout_workers=rollout_workers,
+        base_model=config.model.model_name,
+        max_model_len=config.model.max_model_len,
+    )
+
+    # Handle initialization failure with fallback
+    if weight_sync_strategy.requires_model_path and rollout_model_path is None:
+        logger.warning(
+            f"Strategy {weight_sync_strategy.name} requires model_path but initialization failed. "
+            "Attempting fallback..."
+        )
+        fallback_strategy = weight_sync_strategy.get_fallback_strategy()
+        if fallback_strategy:
+            logger.info(f"Using fallback strategy: {fallback_strategy.name}")
+            weight_sync_strategy = fallback_strategy
+            rollout_model_path = weight_sync_strategy.initialize_workers(
+                rollout_workers=rollout_workers,
                 base_model=config.model.model_name,
                 max_model_len=config.model.max_model_len,
             )
-            warmup_futures.append(future)
+        else:
+            # Last resort: use HuggingFace model name
+            rollout_model_path = config.model.model_name
 
-        # Wait for initialization and get the model path
-        for future in warmup_futures:
-            rollout_model_path = future.get()  # All workers return same path
-        print(f"  Rollout workers initialized at {rollout_model_path}")
-
-        # Do a quick warmup generation
-        warmup_gen_futures = []
-        for worker in rollout_workers:
-            future = worker.generate.spawn(
-                prompts=["Hello"],
-                model_path=rollout_model_path,
-                max_tokens=10,
-                max_model_len=config.model.max_model_len,
-            )
-            warmup_gen_futures.append(future)
-        for future in warmup_gen_futures:
-            future.get()
-    else:
-        # Standard warmup with HuggingFace model path
-        warmup_futures = []
-        for worker in rollout_workers:
-            future = worker.generate.spawn(
-                prompts=["Hello"],
-                model_path=config.model.model_name,
-                max_tokens=10,
-                max_model_len=config.model.max_model_len,
-            )
-            warmup_futures.append(future)
-
-        # Wait for warmup
-        for future in warmup_futures:
-            future.get()
-
-    print("Rollout workers warmed up")
+    # Set the current model path for generation
+    current_rollout_model_path = rollout_model_path or config.model.model_name
+    logger.info(f"Rollout workers initialized with model path: {current_rollout_model_path}")
 
     # Calculate training steps
     batch_size = config.training.batch_size
@@ -186,21 +251,22 @@ def train(config_dict: Optional[dict] = None):
     if config.training.max_steps > 0:
         total_steps = min(total_steps, config.training.max_steps)
 
-    print(f"Total training steps: {total_steps}")
+    logger.info(f"Total training steps: {total_steps}")
 
-    # Track current model path for rollout workers (updated after checkpoint syncs)
-    # For "reload" mode, use the local volume path; otherwise use HuggingFace name
-    if sync_method == "reload" and rollout_model_path is not None:
-        current_rollout_model_path = rollout_model_path
-    else:
-        current_rollout_model_path = config.model.model_name
+    # Training loop (with checkpoint resumption support)
+    global_step = resume_step
+    if resume_step > 0:
+        logger.info(f"Resuming training from step {resume_step}")
 
-    # Training loop
-    global_step = 0
-    for epoch in range(config.training.num_epochs):
-        print(f"\n=== Epoch {epoch + 1}/{config.training.num_epochs} ===")
+    # Calculate starting epoch and batch for resumption
+    start_epoch = resume_step // num_batches if num_batches > 0 else 0
+    start_batch = resume_step % num_batches if num_batches > 0 else 0
 
-        for batch_idx in range(num_batches):
+    for epoch in range(start_epoch, config.training.num_epochs):
+        epoch_start_batch = start_batch if epoch == start_epoch else 0
+        logger.info(f"\n=== Epoch {epoch + 1}/{config.training.num_epochs} ===")
+
+        for batch_idx in range(epoch_start_batch, num_batches):
             if (
                 config.training.max_steps > 0
                 and global_step >= config.training.max_steps
@@ -212,7 +278,7 @@ def train(config_dict: Optional[dict] = None):
             prompts = batch["prompts"]
             testcases = batch["testcases"]
 
-            print(
+            logger.info(
                 f"\nStep {global_step + 1}/{total_steps}: Processing {len(prompts)} prompts"
             )
 
@@ -250,17 +316,17 @@ def train(config_dict: Optional[dict] = None):
                 all_completions.extend(result["completions"])
                 all_logprobs.extend(result["logprobs"])
 
-            print(f"Generated {len(all_completions)} completions")
+            logger.info(f"Generated {len(all_completions)} completions")
 
             # 3. Compute rewards (parallel via sandboxes)
-            print("Computing rewards...")
+            logger.info("Computing rewards...")
             rewards = list(reward_helper_function(all_completions, expanded_testcases))
             mean_reward = sum(rewards) / len(rewards) if rewards else 0
 
-            print(f"Mean reward: {mean_reward:.4f}")
+            logger.info(f"Mean reward: {mean_reward:.4f}")
 
             # 4. Train step
-            print("Performing training step...")
+            logger.info("Performing training step...")
             loss_result = actor.train_step.remote(
                 prompts=expanded_prompts,
                 completions=all_completions,
@@ -283,140 +349,80 @@ def train(config_dict: Optional[dict] = None):
             wandb.log(metrics, step=global_step)
 
             # Print key metrics
-            print(f"  Loss: {loss_result.get('loss', 0):.4f}, "
-                  f"KL: {loss_result.get('approx_kl', 0):.4f}, "
-                  f"Clip: {loss_result.get('clip_fraction', 0):.2%}")
+            logger.info(
+                f"  Loss: {loss_result.get('loss', 0):.4f}, "
+                f"KL: {loss_result.get('approx_kl', 0):.4f}, "
+                f"Clip: {loss_result.get('clip_fraction', 0):.2%}"
+            )
 
             # 5. Sync weights to rollout workers (periodically)
             if (global_step + 1) % config.training.sync_weights_every == 0:
-                sync_method = config.training.weight_sync_method
-                print(f"Syncing weights to rollout workers (method: {sync_method})...")
+                logger.info(f"Syncing weights to rollout workers (strategy: {weight_sync_strategy.name})...")
 
                 try:
-                    import time
-                    sync_start = time.time()
+                    # Use the weight sync strategy
+                    sync_result: WeightSyncResult = weight_sync_strategy.sync(
+                        actor=actor,
+                        rollout_workers=rollout_workers,
+                        step=global_step + 1,
+                        model_path=rollout_model_path,
+                        config=config.to_dict(),
+                        base_model=config.model.model_name,
+                        max_model_len=config.model.max_model_len,
+                    )
 
-                    if sync_method == "direct":
-                        # DIRECT: In-memory weight update via vLLM's load_weights()
-                        # Fastest method - no disk I/O, updates weights in-place
-                        weights_bytes = actor.get_weights.remote(config=config.to_dict())
-                        get_weights_time = time.time() - sync_start
-                        weights_size_mb = len(weights_bytes) / (1024 * 1024)
-                        print(f"  Got weights: {weights_size_mb:.1f} MB in {get_weights_time:.2f}s")
+                    # Log sync results
+                    logger.info(
+                        f"Weight sync completed: {sync_result.workers_synced}/{sync_result.workers_total} "
+                        f"workers in {sync_result.sync_time_seconds:.2f}s"
+                    )
 
-                        # Update all rollout workers directly (parallel)
-                        sync_futures = []
-                        for worker in rollout_workers:
-                            future = worker.update_weights_direct.spawn(weights_bytes)
-                            sync_futures.append(future)
+                    # Update model path if checkpoint strategy returned a new path
+                    if sync_result.details.get("checkpoint_path"):
+                        current_rollout_model_path = sync_result.details["checkpoint_path"]
 
-                        # Wait for all workers to complete
-                        sync_results = [f.get() for f in sync_futures]
-                        success_count = sum(sync_results)
-
-                        sync_time = time.time() - sync_start
-                        print(f"  Weights synced to {success_count}/{len(rollout_workers)} workers in {sync_time:.2f}s")
-
-                    elif sync_method == "volume":
-                        # VOLUME: Save to shared volume, workers load from volume
-                        # Good balance of speed and reliability, avoids large network transfers
-                        manifest = actor.sync_weights_to_volume.remote(
-                            sync_id=global_step + 1,
-                            config=config.to_dict(),
-                        )
-                        print(f"  Weights saved to volume (sync_id: {manifest['sync_id']})")
-
-                        # Reload rollout workers from volume using optimized method
-                        sync_futures = []
-                        for worker in rollout_workers:
-                            future = worker.load_from_weight_sync.spawn(
-                                base_model=config.model.model_name,
-                                sync_dir="/storage/weight_sync",
-                                max_model_len=config.model.max_model_len,
+                    # Warn about partial failures
+                    if not sync_result.success:
+                        if sync_result.error:
+                            logger.warning(f"Weight sync had errors: {sync_result.error}")
+                        elif sync_result.workers_synced < sync_result.workers_total:
+                            logger.warning(
+                                f"{sync_result.workers_total - sync_result.workers_synced} "
+                                "workers failed to sync"
                             )
-                            sync_futures.append(future)
 
-                        sync_results = [f.get() for f in sync_futures]
-                        success_count = sum(sync_results)
-
-                        sync_time = time.time() - sync_start
-                        print(f"  Weights synced via volume in {sync_time:.2f}s")
-
-                    elif sync_method == "reload":
-                        # RELOAD: Save weights to model path, use vLLM reload_weights
-                        # Most efficient - uses sleep/wake_up/reload_weights pattern
-                        if rollout_model_path is None:
-                            print("  Warning: rollout_model_path not set, falling back to volume sync")
-                            sync_method = "volume"
-                        else:
-                            # Save weights to the model path rollout workers are using
-                            manifest = actor.sync_weights_to_model_path.remote(
-                                model_path=rollout_model_path,
-                                sync_id=global_step + 1,
-                                config=config.to_dict(),
-                            )
-                            print(f"  Weights saved to {rollout_model_path}")
-
-                            # Reload weights in rollout workers (uses sleep/wake_up pattern)
-                            sync_futures = []
-                            for worker in rollout_workers:
-                                future = worker.update_weights_from_volume.spawn(
-                                    weights_path=rollout_model_path,
+                        # Try fallback if available and sync failed completely
+                        if sync_result.workers_synced == 0:
+                            fallback = weight_sync_strategy.get_fallback_strategy()
+                            if fallback:
+                                logger.info(f"Attempting fallback strategy: {fallback.name}")
+                                fallback_result = fallback.sync(
+                                    actor=actor,
+                                    rollout_workers=rollout_workers,
+                                    step=global_step + 1,
+                                    config=config.to_dict(),
+                                    base_model=config.model.model_name,
+                                    max_model_len=config.model.max_model_len,
                                 )
-                                sync_futures.append(future)
-
-                            sync_results = [f.get() for f in sync_futures]
-                            success_count = sum(sync_results)
-
-                            sync_time = time.time() - sync_start
-                            print(f"  Weights reloaded in {sync_time:.2f}s (efficient reload)")
-
-                    elif sync_method == "checkpoint":
-                        # CHECKPOINT: Full checkpoint save + reload (most reliable, slowest)
-                        sync_checkpoint_path = actor.save_checkpoint.remote(
-                            step=global_step + 1,
-                            config=config.to_dict(),
-                        )
-                        print(f"  Checkpoint saved to: {sync_checkpoint_path}")
-
-                        # Reload rollout workers from checkpoint
-                        sync_futures = []
-                        for worker in rollout_workers:
-                            future = worker.reload_from_checkpoint.spawn(sync_checkpoint_path)
-                            sync_futures.append(future)
-
-                        sync_results = [f.get() for f in sync_futures]
-                        success_count = sum(sync_results)
-
-                        # Update model path for future generate calls
-                        current_rollout_model_path = sync_checkpoint_path
-
-                        sync_time = time.time() - sync_start
-                        print(f"  Weights synced via checkpoint in {sync_time:.2f}s")
-
-                    else:
-                        print(f"  Warning: Unknown sync method '{sync_method}', skipping")
-                        success_count = 0
-
-                    if success_count < len(rollout_workers):
-                        print(f"  Warning: {len(rollout_workers) - success_count} workers failed to sync")
+                                if fallback_result.success:
+                                    logger.info(f"Fallback succeeded: {fallback_result.workers_synced} workers synced")
 
                 except Exception as e:
-                    print(f"Warning: Weight sync failed: {e}")
+                    logger.error(f"Weight sync failed: {e}")
                     import traceback
                     traceback.print_exc()
-                    print("Continuing with current rollout weights...")
+                    logger.warning("Continuing with current rollout weights...")
 
             # 6. Checkpoint periodically
             if (global_step + 1) % config.training.save_steps == 0:
-                print("Saving checkpoint...")
+                logger.info("Saving checkpoint...")
                 checkpoint_path = actor.save_checkpoint.remote(global_step + 1, config=config.to_dict())
-                print(f"Checkpoint saved: {checkpoint_path}")
+                logger.info(f"Checkpoint saved: {checkpoint_path}")
 
             global_step += 1
 
     # Final checkpoint
-    print("\nSaving final checkpoint...")
+    logger.info("\nSaving final checkpoint...")
     final_checkpoint = actor.save_checkpoint.remote(global_step, config=config.to_dict())
 
     # Commit volume
@@ -462,7 +468,7 @@ def train_simple(config_dict: Optional[dict] = None):
         config_dict = {}
     config = OrchestratorConfig.from_dict(config_dict)
 
-    print(f"Starting simple training with config: {config.to_dict()}")
+    logger.info(f"Starting simple training with config: {config.to_dict()}")
 
     # Load dataset
     dataset = load_dataset(
@@ -476,7 +482,7 @@ def train_simple(config_dict: Optional[dict] = None):
     if config.max_samples:
         dataset = dataset.select(range(min(config.max_samples, len(dataset))))
 
-    print(f"Dataset loaded with {len(dataset)} samples")
+    logger.info(f"Dataset loaded with {len(dataset)} samples")
 
     # Build GRPOConfig kwargs
     grpo_kwargs = {
@@ -524,7 +530,7 @@ def train_simple(config_dict: Optional[dict] = None):
             task_type=TaskType.CAUSAL_LM,
             bias="none",
         )
-        print(f"LoRA enabled: r={peft_config.r}, alpha={peft_config.lora_alpha}")
+        logger.info(f"LoRA enabled: r={peft_config.r}, alpha={peft_config.lora_alpha}")
 
     # Create trainer
     trainer_kwargs = {

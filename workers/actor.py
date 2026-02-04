@@ -8,8 +8,12 @@ import modal
 # Import app and resources from the shared app module
 # Note: For Modal, all files need to share the same app instance
 from MRL.app import app, volume, TRAINING_IMAGE
+from MRL.logging_config import get_logger
 
 STORAGE_PATH = "/storage"
+
+# Module logger
+logger = get_logger("actor")
 
 
 @app.cls(
@@ -35,7 +39,8 @@ class ActorWorker:
         self.tokenizer = None
         self.config = None
         self.initialized = False
-        print("ActorWorker container started, awaiting initialization...")
+        self._gradient_accumulation_count = 0  # Track gradient accumulation
+        logger.info("ActorWorker container started, awaiting initialization...")
 
     def _do_initialize(self, config: dict, resume_from: Optional[str] = None) -> bool:
         """Internal initialization logic.
@@ -55,7 +60,7 @@ class ActorWorker:
         self.config = config
         model_name = config.get("model_name", "Qwen/Qwen2-0.5B-Instruct")
 
-        print(f"Initializing ActorWorker with model: {model_name}")
+        logger.info(f"Initializing ActorWorker with model: {model_name}")
 
         # Load dataset
         dataset = load_dataset(
@@ -70,7 +75,7 @@ class ActorWorker:
         if max_samples:
             dataset = dataset.select(range(min(max_samples, len(dataset))))
 
-        print(f"Dataset loaded with {len(dataset)} samples")
+        logger.info(f"Dataset loaded with {len(dataset)} samples")
 
         # Create dummy reward function (actual rewards come from orchestrator)
         def dummy_reward_func(completions, **kwargs):
@@ -125,7 +130,7 @@ class ActorWorker:
                 task_type=TaskType.CAUSAL_LM,
                 bias="none",
             )
-            print(f"LoRA enabled: r={peft_config.r}, alpha={peft_config.lora_alpha}, targets={target_modules}")
+            logger.info(f"LoRA enabled: r={peft_config.r}, alpha={peft_config.lora_alpha}, targets={target_modules}")
 
         # Initialize trainer
         trainer_kwargs = {
@@ -156,7 +161,7 @@ class ActorWorker:
 
         self.initialized = True
 
-        print("ActorWorker initialized successfully")
+        logger.info("ActorWorker initialized successfully")
         return True
 
     @modal.method()
@@ -185,7 +190,7 @@ class ActorWorker:
         if not self.initialized:
             raise RuntimeError("ActorWorker not initialized. Call initialize() first.")
 
-        print("Starting full training loop...")
+        logger.info("Starting full training loop...")
         self.trainer.train()
 
         # Commit volume changes
@@ -228,7 +233,7 @@ class ActorWorker:
                 raise RuntimeError(
                     "ActorWorker not initialized. Provide config or call initialize() first."
                 )
-            print("Auto-initializing ActorWorker...")
+            logger.info("Auto-initializing ActorWorker...")
             self._do_initialize(config)
 
         import torch
@@ -284,7 +289,14 @@ class ActorWorker:
             )
 
         # Extract logits for completion tokens only
-        logits = outputs.logits[:, inputs.input_ids.shape[1] - 1 : -1, :]
+        # Bug fix: The previous slicing [:, prompt_len - 1 : -1, :] dropped the last completion token
+        # Correct: We need logits from position (prompt_len - 1) which predicts the first completion token
+        # through position (prompt_len + completion_len - 1) which predicts the last completion token
+        # The logits at position i predict token at position i+1
+        prompt_len = inputs.input_ids.shape[1]
+        completion_len = completion_inputs.input_ids.shape[1]
+        # Get logits that predict the completion tokens (indices [prompt_len-1, prompt_len+completion_len-1))
+        logits = outputs.logits[:, prompt_len - 1 : prompt_len + completion_len - 1, :]
         log_probs = torch.log_softmax(logits, dim=-1)
 
         # Get per-token log probs for actual completion tokens
@@ -411,10 +423,36 @@ class ActorWorker:
             # Fallback: simple mean
             loss = (per_token_loss * mask).sum() / mask.sum().clamp(min=1.0)
 
-        # === Backward Pass ===
-        self.trainer.accelerator.backward(loss)
-        self.trainer.optimizer.step()
-        self.trainer.optimizer.zero_grad()
+        # === Gradient Accumulation ===
+        gradient_accumulation_steps = self.config.get("gradient_accumulation_steps", 1)
+
+        # Scale loss by number of accumulation steps
+        if gradient_accumulation_steps > 1:
+            scaled_loss = loss / gradient_accumulation_steps
+        else:
+            scaled_loss = loss
+
+        # Backward pass (accumulates gradients)
+        self.trainer.accelerator.backward(scaled_loss)
+
+        # Track accumulation count
+        self._gradient_accumulation_count += 1
+
+        # Only step optimizer after accumulating enough gradients
+        did_step = False
+        if self._gradient_accumulation_count >= gradient_accumulation_steps:
+            # Gradient clipping (optional but recommended)
+            max_grad_norm = self.config.get("max_grad_norm", 1.0)
+            if max_grad_norm is not None and max_grad_norm > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    max_grad_norm
+                )
+
+            self.trainer.optimizer.step()
+            self.trainer.optimizer.zero_grad()
+            self._gradient_accumulation_count = 0
+            did_step = True
 
         # === Compute Metrics ===
         with torch.no_grad():
@@ -437,6 +475,8 @@ class ActorWorker:
             "clip_fraction": clip_frac.item(),
             "approx_kl": approx_kl.item(),
             "loss_type": loss_type,
+            "did_optimizer_step": did_step,
+            "gradient_accumulation_count": self._gradient_accumulation_count,
         }
 
     @modal.method()
@@ -446,6 +486,10 @@ class ActorWorker:
         NOTE: This method transfers large amounts of data over the network.
         For optimal performance, use sync_weights_to_volume() instead.
 
+        This method properly handles:
+        - Tied weights (embed_tokens/lm_head) by skipping duplicates
+        - LoRA weights by merging and cleaning
+
         Returns:
             Serialized model state dict
         """
@@ -454,19 +498,47 @@ class ActorWorker:
                 raise RuntimeError(
                     "ActorWorker not initialized. Provide config or call initialize() first."
                 )
-            print("Auto-initializing ActorWorker for get_weights...")
+            logger.info("Auto-initializing ActorWorker for get_weights...")
             self._do_initialize(config)
 
-        import torch
+        from MRL.workers.utils import clean_state_dict_for_vllm, serialize_state_dict
 
-        buffer = io.BytesIO()
         # Get the underlying model (unwrap from any wrappers)
         model_to_save = self.trainer.model
         if hasattr(model_to_save, "module"):
             model_to_save = model_to_save.module
 
-        torch.save(model_to_save.state_dict(), buffer)
-        return buffer.getvalue()
+        # Handle LoRA models - merge weights for vLLM compatibility
+        if self.config.get("use_lora", False):
+            from peft import PeftModel
+            if isinstance(model_to_save, PeftModel):
+                logger.info("Merging LoRA weights for serialization...")
+                model_to_save.merge_adapter()
+                try:
+                    raw_state_dict = model_to_save.state_dict()
+                    state_dict = clean_state_dict_for_vllm(
+                        raw_state_dict,
+                        skip_tied_weights=True,
+                        skip_lora_weights=True,
+                    )
+                finally:
+                    # Always unmerge to allow continued training
+                    model_to_save.unmerge_adapter()
+            else:
+                state_dict = clean_state_dict_for_vllm(
+                    model_to_save.state_dict(),
+                    skip_tied_weights=True,
+                    skip_lora_weights=True,
+                )
+        else:
+            state_dict = clean_state_dict_for_vllm(
+                model_to_save.state_dict(),
+                skip_tied_weights=True,
+                skip_lora_weights=False,
+            )
+
+        # Serialize with tied weight handling
+        return serialize_state_dict(state_dict, skip_tied_weights=False)  # Already cleaned
 
     @modal.method()
     def sync_weights_to_volume(self, sync_id: int, config: Optional[dict] = None) -> dict:
@@ -487,7 +559,7 @@ class ActorWorker:
                 raise RuntimeError(
                     "ActorWorker not initialized. Provide config or call initialize() first."
                 )
-            print("Auto-initializing ActorWorker for sync_weights_to_volume...")
+            logger.info("Auto-initializing ActorWorker for sync_weights_to_volume...")
             self._do_initialize(config)
 
         import json
@@ -507,51 +579,47 @@ class ActorWorker:
 
         # Save weights in safetensors format (faster loading)
         weights_path = f"{sync_dir}/model.safetensors"
-        print(f"Saving weights to {weights_path}...")
+        logger.info(f"Saving weights to {weights_path}...")
         start_time = time.time()
+
+        from MRL.workers.utils import clean_state_dict_for_vllm
 
         # Handle LoRA models - merge weights for vLLM compatibility
         if self.config.get("use_lora", False):
             from peft import PeftModel
             if isinstance(model_to_save, PeftModel):
-                print("  Merging LoRA weights for vLLM compatibility...")
+                logger.info("Merging LoRA weights for vLLM compatibility...")
                 # Merge LoRA adapters into base weights
                 model_to_save.merge_adapter()
-
-                # Get state dict and filter/rename keys for vLLM compatibility
-                raw_state_dict = model_to_save.state_dict()
-                state_dict = {}
-
-                for key, value in raw_state_dict.items():
-                    # Skip LoRA-specific parameters (lora_A, lora_B weights)
-                    if "lora_" in key:
-                        continue
-
-                    # Remove base_model.model. prefix
-                    clean_key = key.replace("base_model.model.", "")
-
-                    # Remove .base_layer from key names (LoRA wraps original layers)
-                    clean_key = clean_key.replace(".base_layer", "")
-
-                    state_dict[clean_key] = value
-
-                # Unmerge to allow continued LoRA training
-                model_to_save.unmerge_adapter()
+                try:
+                    raw_state_dict = model_to_save.state_dict()
+                    state_dict = clean_state_dict_for_vllm(
+                        raw_state_dict,
+                        skip_tied_weights=True,
+                        skip_lora_weights=True,
+                    )
+                finally:
+                    # Always unmerge to allow continued LoRA training (fixes race condition)
+                    model_to_save.unmerge_adapter()
             else:
-                state_dict = model_to_save.state_dict()
-                state_dict = {
-                    k.replace("base_model.model.", "").replace("base_model.", ""): v
-                    for k, v in state_dict.items()
-                }
+                state_dict = clean_state_dict_for_vllm(
+                    model_to_save.state_dict(),
+                    skip_tied_weights=True,
+                    skip_lora_weights=True,
+                )
         else:
-            state_dict = model_to_save.state_dict()
+            state_dict = clean_state_dict_for_vllm(
+                model_to_save.state_dict(),
+                skip_tied_weights=True,
+                skip_lora_weights=False,
+            )
 
         # Convert to CPU and ensure contiguous for safetensors
         state_dict_cpu = {k: v.cpu().contiguous() for k, v in state_dict.items()}
         save_file(state_dict_cpu, weights_path)
 
         save_time = time.time() - start_time
-        print(f"Weights saved in {save_time:.2f}s")
+        logger.info(f"Weights saved in {save_time:.2f}s")
 
         # Write sync manifest with metadata
         manifest = {
@@ -592,7 +660,7 @@ class ActorWorker:
                 raise RuntimeError(
                     "ActorWorker not initialized. Provide config or call initialize() first."
                 )
-            print("Auto-initializing ActorWorker for sync_weights_to_model_path...")
+            logger.info("Auto-initializing ActorWorker for sync_weights_to_model_path...")
             self._do_initialize(config)
 
         import json
@@ -600,8 +668,9 @@ class ActorWorker:
         import time
 
         from safetensors.torch import save_file
+        from MRL.workers.utils import clean_state_dict_for_vllm
 
-        print(f"Saving weights to model path: {model_path}")
+        logger.info(f"Saving weights to model path: {model_path}")
         start_time = time.time()
 
         # Ensure directory exists
@@ -617,43 +686,37 @@ class ActorWorker:
         if self.config.get("use_lora", False):
             from peft import PeftModel
             if isinstance(model_to_save, PeftModel):
-                print("  Merging LoRA weights for vLLM compatibility...")
+                logger.info("Merging LoRA weights for vLLM compatibility...")
                 # Merge LoRA adapters into base weights
                 model_to_save.merge_adapter()
-
-                # Get state dict and filter/rename keys for vLLM compatibility
-                raw_state_dict = model_to_save.state_dict()
-                state_dict = {}
-
-                for key, value in raw_state_dict.items():
-                    # Skip LoRA-specific parameters (lora_A, lora_B weights)
-                    if "lora_" in key:
-                        continue
-
-                    # Remove base_model.model. prefix
-                    clean_key = key.replace("base_model.model.", "")
-
-                    # Remove .base_layer from key names (LoRA wraps original layers)
-                    clean_key = clean_key.replace(".base_layer", "")
-
-                    state_dict[clean_key] = value
-
-                # Unmerge to allow continued LoRA training
-                model_to_save.unmerge_adapter()
+                try:
+                    raw_state_dict = model_to_save.state_dict()
+                    state_dict = clean_state_dict_for_vllm(
+                        raw_state_dict,
+                        skip_tied_weights=True,
+                        skip_lora_weights=True,
+                    )
+                finally:
+                    # Always unmerge to allow continued LoRA training (fixes race condition)
+                    model_to_save.unmerge_adapter()
             else:
-                state_dict = model_to_save.state_dict()
-                state_dict = {
-                    k.replace("base_model.model.", "").replace("base_model.", ""): v
-                    for k, v in state_dict.items()
-                }
+                state_dict = clean_state_dict_for_vllm(
+                    model_to_save.state_dict(),
+                    skip_tied_weights=True,
+                    skip_lora_weights=True,
+                )
         else:
-            state_dict = model_to_save.state_dict()
+            state_dict = clean_state_dict_for_vllm(
+                model_to_save.state_dict(),
+                skip_tied_weights=True,
+                skip_lora_weights=False,
+            )
 
         state_dict_cpu = {k: v.cpu().contiguous() for k, v in state_dict.items()}
         save_file(state_dict_cpu, weights_path)
 
         save_time = time.time() - start_time
-        print(f"Weights saved to {weights_path} in {save_time:.2f}s")
+        logger.info(f"Weights saved to {weights_path} in {save_time:.2f}s")
 
         # Write sync manifest
         manifest = {
@@ -695,7 +758,7 @@ class ActorWorker:
                 raise RuntimeError(
                     "ActorWorker not initialized. Provide config or call initialize() first."
                 )
-            print("Auto-initializing ActorWorker for get_weights_chunked...")
+            logger.info("Auto-initializing ActorWorker for get_weights_chunked...")
             self._do_initialize(config)
 
         import torch
@@ -729,34 +792,149 @@ class ActorWorker:
         if current_chunk:
             chunks.append(current_chunk)
 
-        print(f"Split weights into {len(chunks)} chunks")
+        logger.info(f"Split weights into {len(chunks)} chunks")
         return chunks
 
     @modal.method()
-    def save_checkpoint(self, step: int, config: Optional[dict] = None) -> str:
-        """Save checkpoint to volume.
+    def save_checkpoint(
+        self,
+        step: int,
+        config: Optional[dict] = None,
+        save_optimizer: bool = True,
+    ) -> str:
+        """Save checkpoint to volume with full training state.
+
+        Saves:
+        - Model weights
+        - Optimizer state
+        - Training state (step, epoch, etc.)
+        - Configuration
 
         Args:
             step: Current training step
             config: Optional config dict to initialize if not already initialized
+            save_optimizer: Whether to save optimizer state (for resumption)
 
         Returns:
             Path to saved checkpoint
         """
+        import json
+        import os
+
+        import torch
+
         if not self.initialized:
             if config is None:
                 raise RuntimeError(
                     "ActorWorker not initialized. Provide config or call initialize() first."
                 )
-            print("Auto-initializing ActorWorker for save_checkpoint...")
+            logger.info("Auto-initializing ActorWorker for save_checkpoint...")
             self._do_initialize(config)
 
         checkpoint_path = f"{STORAGE_PATH}/checkpoints/step-{step}"
+        os.makedirs(checkpoint_path, exist_ok=True)
+
+        # Save model weights
         self.trainer.save_model(checkpoint_path)
+
+        # Save training state for resumption
+        training_state = {
+            "global_step": step,
+            "gradient_accumulation_count": self._gradient_accumulation_count,
+            "config": self.config,
+        }
+
+        state_path = os.path.join(checkpoint_path, "training_state.json")
+        with open(state_path, "w") as f:
+            json.dump(training_state, f, indent=2)
+
+        # Save optimizer and scheduler state (for exact resumption)
+        if save_optimizer and self.trainer.optimizer is not None:
+            optimizer_path = os.path.join(checkpoint_path, "optimizer.pt")
+            torch.save(
+                {
+                    "optimizer": self.trainer.optimizer.state_dict(),
+                    "scheduler": (
+                        self.trainer.lr_scheduler.state_dict()
+                        if self.trainer.lr_scheduler is not None
+                        else None
+                    ),
+                },
+                optimizer_path,
+            )
+
         volume.commit()
 
-        print(f"Checkpoint saved to {checkpoint_path}")
+        logger.info(f"Checkpoint saved to {checkpoint_path} (step={step})")
         return checkpoint_path
+
+    @modal.method()
+    def load_checkpoint(self, checkpoint_path: str, config: Optional[dict] = None) -> dict:
+        """Load checkpoint and restore training state.
+
+        Args:
+            checkpoint_path: Path to checkpoint directory
+            config: Optional config dict (uses saved config if not provided)
+
+        Returns:
+            Dictionary with restored training state
+        """
+        import json
+        import os
+
+        import torch
+
+        logger.info(f"Loading checkpoint from {checkpoint_path}...")
+
+        # Load training state
+        state_path = os.path.join(checkpoint_path, "training_state.json")
+        if os.path.exists(state_path):
+            with open(state_path) as f:
+                training_state = json.load(f)
+            saved_config = training_state.get("config", {})
+        else:
+            training_state = {}
+            saved_config = {}
+
+        # Merge configs (provided config takes precedence)
+        effective_config = saved_config.copy()
+        if config:
+            effective_config.update(config)
+
+        # Initialize trainer if needed (this loads the model from checkpoint)
+        if not self.initialized:
+            # Point to checkpoint for model loading
+            effective_config["model_name"] = checkpoint_path
+            self._do_initialize(effective_config)
+
+        # Restore training state
+        self._gradient_accumulation_count = training_state.get(
+            "gradient_accumulation_count", 0
+        )
+
+        # Load optimizer and scheduler state
+        optimizer_path = os.path.join(checkpoint_path, "optimizer.pt")
+        if os.path.exists(optimizer_path):
+            logger.info("Restoring optimizer and scheduler state...")
+            checkpoint_data = torch.load(optimizer_path, map_location="cuda")
+
+            if self.trainer.optimizer is not None and "optimizer" in checkpoint_data:
+                self.trainer.optimizer.load_state_dict(checkpoint_data["optimizer"])
+
+            if (
+                self.trainer.lr_scheduler is not None
+                and checkpoint_data.get("scheduler") is not None
+            ):
+                self.trainer.lr_scheduler.load_state_dict(checkpoint_data["scheduler"])
+
+        restored_state = {
+            "global_step": training_state.get("global_step", 0),
+            "gradient_accumulation_count": self._gradient_accumulation_count,
+            "checkpoint_path": checkpoint_path,
+        }
+
+        logger.info(f"Checkpoint loaded, resuming from step {restored_state['global_step']}")
+        return restored_state
 
     @modal.method()
     def get_current_step(self) -> int:

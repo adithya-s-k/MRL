@@ -22,6 +22,8 @@ def main(
     sync_weights_every: int = 1,
     weight_sync_method: str = "reload",
     simple_mode: bool = False,
+    # Checkpoint resumption
+    resume_from: str = None,
     # GRPO algorithm parameters
     loss_type: str = "dapo",
     beta: float = 0.0,
@@ -59,6 +61,7 @@ def main(
             "direct" - in-memory transfer (has issues with tied weights, not recommended)
             "checkpoint" - full checkpoint save + reload (slowest)
         simple_mode: Use TRL's built-in training loop instead of orchestrator (default: False)
+        resume_from: Path to checkpoint to resume from, e.g., "/storage/checkpoints/step-100" (default: None)
         loss_type: GRPO loss type - grpo, dr_grpo, dapo, bnpo, cispo, sapo (default: dapo)
         beta: KL penalty coefficient, DeepSeek R1 uses 0.001 (default: 0.0)
         epsilon: PPO-style clipping epsilon (default: 0.2)
@@ -113,12 +116,17 @@ def main(
         print("   - Tied weights (embed_tokens/lm_head) cause serialization errors")
         print("   - Recommended: use --weight-sync-method reload instead")
 
+    if resume_from:
+        print(f"\n📂 Resuming from checkpoint: {resume_from}")
+
     if simple_mode:
         print("\nUsing simple mode (TRL built-in training loop)")
+        if resume_from:
+            print("  ⚠️  Note: simple_mode does not support checkpoint resumption")
         result = train_simple.remote(config)
     else:
         print("\nUsing orchestrator mode (veRL-style distributed training)")
-        result = train.remote(config)
+        result = train.remote(config, resume_from=resume_from)
 
     print(f"\nTraining result: {result}")
 

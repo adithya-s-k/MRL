@@ -1,7 +1,44 @@
-"""Configuration dataclasses for GRPO training."""
+"""Configuration dataclasses for GRPO training with validation."""
 
+import json
 from dataclasses import dataclass, field
-from typing import Optional
+from pathlib import Path
+from typing import Literal, Optional, Union
+
+from MRL.logging_config import get_logger
+
+logger = get_logger("config")
+
+
+class ConfigValidationError(Exception):
+    """Raised when configuration validation fails."""
+    pass
+
+
+def _validate_range(value: float, min_val: float, max_val: float, name: str) -> None:
+    """Validate a value is within a range."""
+    if value < min_val or value > max_val:
+        raise ConfigValidationError(
+            f"{name} must be between {min_val} and {max_val}, got {value}"
+        )
+
+
+def _validate_positive(value: Union[int, float], name: str, allow_zero: bool = False) -> None:
+    """Validate a value is positive."""
+    if allow_zero:
+        if value < 0:
+            raise ConfigValidationError(f"{name} must be >= 0, got {value}")
+    else:
+        if value <= 0:
+            raise ConfigValidationError(f"{name} must be > 0, got {value}")
+
+
+def _validate_choice(value: str, choices: list, name: str) -> None:
+    """Validate a value is one of allowed choices."""
+    if value not in choices:
+        raise ConfigValidationError(
+            f"{name} must be one of {choices}, got '{value}'"
+        )
 
 
 @dataclass
@@ -12,6 +49,16 @@ class ModelConfig:
     max_model_len: int = 16384
     trust_remote_code: bool = True
 
+    def __post_init__(self):
+        """Validate model configuration."""
+        if not self.model_name:
+            raise ConfigValidationError("model_name cannot be empty")
+        _validate_positive(self.max_model_len, "max_model_len")
+        if self.max_model_len > 131072:  # 128k context limit
+            logger.warning(
+                f"max_model_len={self.max_model_len} is very large, may cause OOM"
+            )
+
 
 @dataclass
 class GenerationConfig:
@@ -21,6 +68,13 @@ class GenerationConfig:
     temperature: float = 0.7
     top_p: float = 0.9
     n: int = 1  # Number of completions per prompt
+
+    def __post_init__(self):
+        """Validate generation configuration."""
+        _validate_positive(self.max_tokens, "max_tokens")
+        _validate_range(self.temperature, 0.0, 2.0, "temperature")
+        _validate_range(self.top_p, 0.0, 1.0, "top_p")
+        _validate_positive(self.n, "n")
 
 
 @dataclass
@@ -62,6 +116,7 @@ class TrainingConfig:
 
     # Memory optimizations
     gradient_checkpointing: bool = True  # Reduces memory by recomputing activations
+    max_grad_norm: Optional[float] = 1.0  # Gradient clipping (None to disable)
 
     # Legacy (kept for backwards compatibility, use beta instead)
     kl_coef: float = 0.1
@@ -82,6 +137,57 @@ class TrainingConfig:
     #   "direct" - in-memory transfer (vLLM 0.15.0 doesn't support custom weights)
     #   "checkpoint" - full checkpoint save + model recreation (slowest)
     weight_sync_method: str = "reload"
+
+    # Valid loss types
+    VALID_LOSS_TYPES = ["grpo", "dr_grpo", "dapo", "bnpo", "cispo", "sapo"]
+    # Valid scale_rewards options
+    VALID_SCALE_REWARDS = ["group", "batch", "none"]
+    # Valid weight sync methods
+    VALID_WEIGHT_SYNC_METHODS = ["reload", "volume", "direct", "checkpoint"]
+
+    def __post_init__(self):
+        """Validate training configuration."""
+        # Basic training validation
+        _validate_positive(self.num_epochs, "num_epochs")
+        if self.max_steps != -1:
+            _validate_positive(self.max_steps, "max_steps")
+        _validate_positive(self.batch_size, "batch_size")
+        _validate_positive(self.gradient_accumulation_steps, "gradient_accumulation_steps")
+        _validate_positive(self.learning_rate, "learning_rate")
+
+        # GRPO validation
+        _validate_positive(self.num_generations, "num_generations")
+        _validate_choice(self.loss_type, self.VALID_LOSS_TYPES, "loss_type")
+        _validate_range(self.beta, 0.0, 1.0, "beta")
+        _validate_range(self.epsilon, 0.0, 1.0, "epsilon")
+        if self.epsilon_high is not None:
+            _validate_range(self.epsilon_high, 0.0, 1.0, "epsilon_high")
+            if self.epsilon_high < self.epsilon:
+                logger.warning(
+                    f"epsilon_high ({self.epsilon_high}) < epsilon ({self.epsilon}), "
+                    "this may cause unexpected clipping behavior"
+                )
+        _validate_choice(self.scale_rewards, self.VALID_SCALE_REWARDS, "scale_rewards")
+        _validate_positive(self.max_completion_length, "max_completion_length")
+
+        # LoRA validation
+        if self.use_lora:
+            _validate_positive(self.lora_r, "lora_r")
+            _validate_positive(self.lora_alpha, "lora_alpha")
+            _validate_range(self.lora_dropout, 0.0, 1.0, "lora_dropout")
+
+        # Checkpointing validation
+        _validate_positive(self.save_steps, "save_steps")
+        _validate_positive(self.logging_steps, "logging_steps")
+        _validate_positive(self.sync_weights_every, "sync_weights_every")
+        _validate_choice(self.weight_sync_method, self.VALID_WEIGHT_SYNC_METHODS, "weight_sync_method")
+
+        # Warn about deprecated/problematic options
+        if self.weight_sync_method == "direct":
+            logger.warning(
+                "weight_sync_method='direct' has known issues with tied weights. "
+                "Consider using 'reload' instead."
+            )
 
 
 @dataclass
@@ -105,6 +211,19 @@ class OrchestratorConfig:
     dataset_config: str = "educational_instruct"
     dataset_split: str = "train"
     max_samples: Optional[int] = 128  # None for full dataset
+
+    def __post_init__(self):
+        """Validate orchestrator configuration."""
+        _validate_positive(self.num_rollout_workers, "num_rollout_workers")
+        if self.max_samples is not None:
+            _validate_positive(self.max_samples, "max_samples")
+
+        # Cross-field validation
+        if self.training.num_generations > 1 and self.num_rollout_workers == 1:
+            logger.info(
+                "num_generations > 1 with single rollout worker may be slow. "
+                "Consider adding more rollout workers."
+            )
 
     def to_dict(self) -> dict:
         """Convert config to dictionary."""
@@ -135,6 +254,7 @@ class OrchestratorConfig:
             "lora_dropout": self.training.lora_dropout,
             "lora_target_modules": self.training.lora_target_modules,
             "gradient_checkpointing": self.training.gradient_checkpointing,
+            "max_grad_norm": self.training.max_grad_norm,
             "kl_coef": self.training.kl_coef,
             "save_steps": self.training.save_steps,
             "checkpoint_dir": self.training.checkpoint_dir,
@@ -183,6 +303,7 @@ class OrchestratorConfig:
             lora_dropout=d.get("lora_dropout", 0.05),
             lora_target_modules=d.get("lora_target_modules"),
             gradient_checkpointing=d.get("gradient_checkpointing", True),
+            max_grad_norm=d.get("max_grad_norm", 1.0),
             kl_coef=d.get("kl_coef", 0.1),
             save_steps=d.get("save_steps", 100),
             checkpoint_dir=d.get("checkpoint_dir", "/storage/checkpoints"),
@@ -201,3 +322,111 @@ class OrchestratorConfig:
             dataset_split=d.get("dataset_split", "train"),
             max_samples=d.get("max_samples", 128),
         )
+
+    @classmethod
+    def from_yaml(cls, yaml_path: Union[str, Path]) -> "OrchestratorConfig":
+        """Load config from YAML file.
+
+        Args:
+            yaml_path: Path to YAML config file
+
+        Returns:
+            OrchestratorConfig instance
+        """
+        try:
+            import yaml
+        except ImportError:
+            raise ImportError("PyYAML is required for YAML config loading. Install with: pip install pyyaml")
+
+        yaml_path = Path(yaml_path)
+        if not yaml_path.exists():
+            raise FileNotFoundError(f"Config file not found: {yaml_path}")
+
+        with open(yaml_path) as f:
+            config_dict = yaml.safe_load(f)
+
+        return cls.from_dict(config_dict)
+
+    @classmethod
+    def from_json(cls, json_path: Union[str, Path]) -> "OrchestratorConfig":
+        """Load config from JSON file.
+
+        Args:
+            json_path: Path to JSON config file
+
+        Returns:
+            OrchestratorConfig instance
+        """
+        json_path = Path(json_path)
+        if not json_path.exists():
+            raise FileNotFoundError(f"Config file not found: {json_path}")
+
+        with open(json_path) as f:
+            config_dict = json.load(f)
+
+        return cls.from_dict(config_dict)
+
+    def to_yaml(self, yaml_path: Union[str, Path]) -> None:
+        """Save config to YAML file.
+
+        Args:
+            yaml_path: Path to save YAML config file
+        """
+        try:
+            import yaml
+        except ImportError:
+            raise ImportError("PyYAML is required for YAML config saving. Install with: pip install pyyaml")
+
+        yaml_path = Path(yaml_path)
+        with open(yaml_path, "w") as f:
+            yaml.dump(self.to_dict(), f, default_flow_style=False, sort_keys=False)
+
+    def to_json(self, json_path: Union[str, Path]) -> None:
+        """Save config to JSON file.
+
+        Args:
+            json_path: Path to save JSON config file
+        """
+        json_path = Path(json_path)
+        with open(json_path, "w") as f:
+            json.dump(self.to_dict(), f, indent=2)
+
+
+def validate_config(config: OrchestratorConfig) -> list[str]:
+    """Validate configuration and return list of warnings.
+
+    Args:
+        config: Configuration to validate
+
+    Returns:
+        List of warning messages
+    """
+    warnings = []
+
+    # Check for memory concerns
+    if config.training.batch_size * config.training.num_generations > 64:
+        warnings.append(
+            f"Large effective batch size ({config.training.batch_size * config.training.num_generations}), "
+            "may cause memory issues"
+        )
+
+    # Check for slow configuration
+    if config.training.weight_sync_method == "checkpoint" and config.training.sync_weights_every == 1:
+        warnings.append(
+            "Checkpoint sync method with sync_weights_every=1 is slow. "
+            "Consider using 'reload' method or increasing sync_weights_every"
+        )
+
+    # Check for suboptimal DAPO config
+    if config.training.loss_type == "dapo":
+        if config.training.epsilon_high is None:
+            warnings.append(
+                "DAPO typically uses epsilon_high=0.28 for asymmetric clipping. "
+                "Consider setting epsilon_high."
+            )
+        if config.training.scale_rewards != "group":
+            warnings.append(
+                "DAPO paper recommends scale_rewards='group' for advantage normalization"
+            )
+
+    return warnings

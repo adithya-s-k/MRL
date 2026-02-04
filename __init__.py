@@ -19,6 +19,7 @@ Usage:
 
 from MRL.app import app, volume, TRAINING_IMAGE, VLLM_IMAGE
 from MRL.config import OrchestratorConfig, ModelConfig, TrainingConfig, GenerationConfig
+from MRL.logging_config import setup_logging, get_logger, get_default_logger
 
 __all__ = [
     "app",
@@ -29,4 +30,7 @@ __all__ = [
     "ModelConfig",
     "TrainingConfig",
     "GenerationConfig",
+    "setup_logging",
+    "get_logger",
+    "get_default_logger",
 ]
