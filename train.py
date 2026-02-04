@@ -20,7 +20,7 @@ def main(
     learning_rate: float = 5e-6,
     save_steps: int = 100,
     sync_weights_every: int = 1,
-    weight_sync_method: str = "direct",
+    weight_sync_method: str = "reload",
     simple_mode: bool = False,
     # GRPO algorithm parameters
     loss_type: str = "dapo",
@@ -35,6 +35,8 @@ def main(
     lora_r: int = 16,
     lora_alpha: int = 32,
     lora_dropout: float = 0.05,
+    # Memory optimizations
+    gradient_checkpointing: bool = True,
 ):
     """Launch GRPO training on Modal.
 
@@ -51,10 +53,10 @@ def main(
         learning_rate: Learning rate (default: 5e-6)
         save_steps: Save checkpoint every N steps (default: 100)
         sync_weights_every: Sync weights to rollout workers every N steps (default: 1)
-        weight_sync_method: Method for syncing weights:
+        weight_sync_method: Method for syncing weights (default: reload):
             "reload" (recommended) - uses vLLM v1 sleep/wake_up/reload_weights
             "volume" - saves to shared volume, workers reload
-            "direct" - in-memory transfer (limited vLLM support)
+            "direct" - in-memory transfer (has issues with tied weights, not recommended)
             "checkpoint" - full checkpoint save + reload (slowest)
         simple_mode: Use TRL's built-in training loop instead of orchestrator (default: False)
         loss_type: GRPO loss type - grpo, dr_grpo, dapo, bnpo, cispo, sapo (default: dapo)
@@ -68,6 +70,7 @@ def main(
         lora_r: LoRA rank (default: 16)
         lora_alpha: LoRA alpha scaling factor (default: 32)
         lora_dropout: LoRA dropout rate (default: 0.05)
+        gradient_checkpointing: Enable gradient checkpointing to save memory (default: True)
     """
     config = {
         "model_name": model,
@@ -96,11 +99,19 @@ def main(
         "lora_r": lora_r,
         "lora_alpha": lora_alpha,
         "lora_dropout": lora_dropout,
+        # Memory optimizations
+        "gradient_checkpointing": gradient_checkpointing,
     }
 
     print("Starting GRPO training with config:")
     for k, v in config.items():
         print(f"  {k}: {v}")
+
+    # Warn about direct weight sync method issues
+    if weight_sync_method == "direct":
+        print("\n⚠️  WARNING: 'direct' weight sync method has known issues with vLLM v1.")
+        print("   - Tied weights (embed_tokens/lm_head) cause serialization errors")
+        print("   - Recommended: use --weight-sync-method reload instead")
 
     if simple_mode:
         print("\nUsing simple mode (TRL built-in training loop)")

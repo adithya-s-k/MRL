@@ -90,7 +90,7 @@ class ActorWorker:
             "logging_steps": config.get("logging_steps", 10),
             "num_generations": config.get("num_generations", 4),
             "bf16": torch.cuda.is_bf16_supported(),
-            "gradient_checkpointing": True,
+            "gradient_checkpointing": config.get("gradient_checkpointing", True),
             # GRPO algorithm parameters (TRL built-in)
             "loss_type": config.get("loss_type", "dapo"),
             "beta": config.get("beta", 0.0),

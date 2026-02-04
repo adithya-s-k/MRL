@@ -60,6 +60,9 @@ class TrainingConfig:
     lora_dropout: float = 0.05
     lora_target_modules: Optional[list] = None  # None means auto-detect
 
+    # Memory optimizations
+    gradient_checkpointing: bool = True  # Reduces memory by recomputing activations
+
     # Legacy (kept for backwards compatibility, use beta instead)
     kl_coef: float = 0.1
 
@@ -131,6 +134,7 @@ class OrchestratorConfig:
             "lora_alpha": self.training.lora_alpha,
             "lora_dropout": self.training.lora_dropout,
             "lora_target_modules": self.training.lora_target_modules,
+            "gradient_checkpointing": self.training.gradient_checkpointing,
             "kl_coef": self.training.kl_coef,
             "save_steps": self.training.save_steps,
             "checkpoint_dir": self.training.checkpoint_dir,
@@ -178,6 +182,7 @@ class OrchestratorConfig:
             lora_alpha=d.get("lora_alpha", 32),
             lora_dropout=d.get("lora_dropout", 0.05),
             lora_target_modules=d.get("lora_target_modules"),
+            gradient_checkpointing=d.get("gradient_checkpointing", True),
             kl_coef=d.get("kl_coef", 0.1),
             save_steps=d.get("save_steps", 100),
             checkpoint_dir=d.get("checkpoint_dir", "/storage/checkpoints"),
