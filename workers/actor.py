@@ -76,30 +76,68 @@ class ActorWorker:
         def dummy_reward_func(completions, **kwargs):
             return [0.0] * len(completions)
 
-        # Training arguments
-        training_args = GRPOConfig(
-            output_dir=config.get("checkpoint_dir", f"{STORAGE_PATH}/checkpoints"),
-            use_vllm=False,  # We handle vLLM separately via RolloutWorkers
-            report_to="none",  # Disable wandb in actor (orchestrator handles it)
-            per_device_train_batch_size=config.get("batch_size", 8),
-            gradient_accumulation_steps=config.get("gradient_accumulation_steps", 1),
-            learning_rate=config.get("learning_rate", 5e-6),
-            num_train_epochs=config.get("num_epochs", 5),
-            max_steps=config.get("max_steps", -1),
-            save_steps=config.get("save_steps", 100),
-            logging_steps=config.get("logging_steps", 10),
-            num_generations=config.get("num_generations", 4),
-            bf16=torch.cuda.is_bf16_supported(),
-            gradient_checkpointing=True,
-        )
+        # Build GRPOConfig kwargs
+        grpo_kwargs = {
+            "output_dir": config.get("checkpoint_dir", f"{STORAGE_PATH}/checkpoints"),
+            "use_vllm": False,  # We handle vLLM separately via RolloutWorkers
+            "report_to": "none",  # Disable wandb in actor (orchestrator handles it)
+            "per_device_train_batch_size": config.get("batch_size", 8),
+            "gradient_accumulation_steps": config.get("gradient_accumulation_steps", 1),
+            "learning_rate": config.get("learning_rate", 5e-6),
+            "num_train_epochs": config.get("num_epochs", 5),
+            "max_steps": config.get("max_steps", -1),
+            "save_steps": config.get("save_steps", 100),
+            "logging_steps": config.get("logging_steps", 10),
+            "num_generations": config.get("num_generations", 4),
+            "bf16": torch.cuda.is_bf16_supported(),
+            "gradient_checkpointing": True,
+            # GRPO algorithm parameters (TRL built-in)
+            "loss_type": config.get("loss_type", "dapo"),
+            "beta": config.get("beta", 0.0),
+            "epsilon": config.get("epsilon", 0.2),
+            "scale_rewards": config.get("scale_rewards", "group"),
+            "mask_truncated_completions": config.get("mask_truncated_completions", False),
+        }
+
+        # Only add epsilon_high if specified (None means use TRL default behavior)
+        epsilon_high = config.get("epsilon_high")
+        if epsilon_high is not None:
+            grpo_kwargs["epsilon_high"] = epsilon_high
+
+        training_args = GRPOConfig(**grpo_kwargs)
+
+        # Configure LoRA if enabled
+        peft_config = None
+        if config.get("use_lora", False):
+            from peft import LoraConfig, TaskType
+
+            # Default target modules for common architectures
+            target_modules = config.get("lora_target_modules")
+            if target_modules is None:
+                # Auto-detect common attention modules
+                target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+            peft_config = LoraConfig(
+                r=config.get("lora_r", 16),
+                lora_alpha=config.get("lora_alpha", 32),
+                lora_dropout=config.get("lora_dropout", 0.05),
+                target_modules=target_modules,
+                task_type=TaskType.CAUSAL_LM,
+                bias="none",
+            )
+            print(f"LoRA enabled: r={peft_config.r}, alpha={peft_config.lora_alpha}, targets={target_modules}")
 
         # Initialize trainer
-        self.trainer = GRPOTrainer(
-            model=model_name,
-            reward_funcs=dummy_reward_func,
-            args=training_args,
-            train_dataset=dataset,
-        )
+        trainer_kwargs = {
+            "model": model_name,
+            "reward_funcs": dummy_reward_func,
+            "args": training_args,
+            "train_dataset": dataset,
+        }
+        if peft_config is not None:
+            trainer_kwargs["peft_config"] = peft_config
+
+        self.trainer = GRPOTrainer(**trainer_kwargs)
 
         self.model = self.trainer.model
         self.tokenizer = self.trainer.tokenizer
@@ -166,14 +204,19 @@ class ActorWorker:
     ) -> dict:
         """Single training step with pre-computed generations and rewards.
 
-        This method allows for veRL-style external orchestration where
-        generation and reward computation happen on separate workers.
+        This method implements TRL's GRPO loss computation with:
+        - Importance sampling (ratio of new/old log probs)
+        - Policy clipping based on loss_type (grpo, dapo, bnpo, dr_grpo, cispo, sapo)
+        - KL penalty when beta != 0
+        - Proper advantage normalization (group/batch/none)
+        - Different aggregation strategies per loss_type
 
         Args:
             prompts: List of prompts
             completions: List of completions (one per prompt)
             rewards: List of rewards for each completion
-            old_logprobs: Optional log probabilities from the rollout model
+            old_logprobs: Optional per-token log probabilities from the rollout model
+                         Shape: list of lists, each inner list is token log probs for one completion
             config: Optional config dict to initialize if not already initialized
 
         Returns:
@@ -190,29 +233,46 @@ class ActorWorker:
 
         import torch
 
-        # This is a simplified version - full implementation would need to
-        # integrate more deeply with GRPOTrainer's internal methods
-        # For now, we use the trainer's built-in step
+        # Get GRPO parameters from config
+        loss_type = self.config.get("loss_type", "dapo")
+        beta = self.config.get("beta", 0.0)
+        epsilon_low = self.config.get("epsilon", 0.2)
+        # epsilon_high defaults to epsilon_low if not specified or None
+        epsilon_high = self.config.get("epsilon_high")
+        if epsilon_high is None:
+            epsilon_high = epsilon_low
+        scale_rewards = self.config.get("scale_rewards", "group")
+        num_generations = self.config.get("num_generations", 4)
 
-        # Tokenize inputs
+        # Max completion length for training (truncate long completions to save memory)
+        # This is separate from max_tokens for generation
+        max_completion_length = min(
+            self.config.get("max_completion_length", 1024),
+            self.config.get("max_tokens", 8000)
+        )
+
+        # Clear CUDA cache before processing
+        torch.cuda.empty_cache()
+
+        # Tokenize inputs (prompts)
         inputs = self.tokenizer(
             prompts,
             return_tensors="pt",
             padding=True,
             truncation=True,
-            max_length=self.config.get("max_model_len", 4096),
+            max_length=1024,  # Limit prompt length for training
         ).to(self.model.device)
 
-        # Tokenize completions
+        # Tokenize completions (truncate to save memory)
         completion_inputs = self.tokenizer(
             completions,
             return_tensors="pt",
             padding=True,
             truncation=True,
-            max_length=self.config.get("max_tokens", 512),
+            max_length=max_completion_length,
         ).to(self.model.device)
 
-        # Forward pass
+        # Forward pass to get current policy log probs
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             outputs = self.model(
                 input_ids=torch.cat(
@@ -223,40 +283,160 @@ class ActorWorker:
                 ),
             )
 
-        # Compute loss (simplified GRPO loss)
+        # Extract logits for completion tokens only
         logits = outputs.logits[:, inputs.input_ids.shape[1] - 1 : -1, :]
         log_probs = torch.log_softmax(logits, dim=-1)
 
-        # Get log probs for actual tokens
+        # Get per-token log probs for actual completion tokens
         completion_tokens = completion_inputs.input_ids
-        token_log_probs = torch.gather(
+        per_token_logps = torch.gather(
             log_probs, dim=-1, index=completion_tokens.unsqueeze(-1)
         ).squeeze(-1)
 
-        # Mask padding
-        mask = completion_inputs.attention_mask
-        token_log_probs = token_log_probs * mask
+        # Mask for valid (non-padding) tokens
+        mask = completion_inputs.attention_mask.float()
 
-        # Sum log probs per sequence
-        seq_log_probs = token_log_probs.sum(dim=-1)
-
-        # Convert rewards to tensor
+        # === Compute Advantages ===
         rewards_tensor = torch.tensor(
             rewards, device=self.model.device, dtype=torch.float32
         )
 
-        # GRPO loss: -E[r * log_prob]
-        loss = -(rewards_tensor * seq_log_probs).mean()
+        # Group-level advantage normalization (GRPO style)
+        batch_size = rewards_tensor.shape[0]
+        num_groups = batch_size // num_generations if num_generations > 1 else batch_size
 
-        # Backward pass
+        if scale_rewards == "group" and num_generations > 1:
+            # Reshape to (num_groups, num_generations) for group statistics
+            grouped_rewards = rewards_tensor.view(num_groups, num_generations)
+            mean_grouped = grouped_rewards.mean(dim=1, keepdim=True)
+            std_grouped = grouped_rewards.std(dim=1, keepdim=True)
+            # Normalize within groups
+            advantages = (grouped_rewards - mean_grouped) / (std_grouped + 1e-8)
+            advantages = advantages.view(-1)  # Flatten back
+        elif scale_rewards == "batch":
+            # Batch-level normalization
+            advantages = (rewards_tensor - rewards_tensor.mean()) / (rewards_tensor.std() + 1e-8)
+        else:
+            # No normalization
+            advantages = rewards_tensor
+
+        # Expand advantages to (B, 1) for broadcasting with per-token losses
+        advantages = advantages.unsqueeze(-1)
+
+        # === Compute Importance Sampling Ratio ===
+        if old_logprobs is not None:
+            # Pad old_logprobs to match completion length
+            max_len = per_token_logps.shape[1]
+            old_per_token_logps = torch.zeros_like(per_token_logps)
+            for i, old_lp in enumerate(old_logprobs):
+                if old_lp is not None and len(old_lp) > 0:
+                    length = min(len(old_lp), max_len)
+                    old_per_token_logps[i, :length] = torch.tensor(
+                        old_lp[:length], device=self.model.device, dtype=per_token_logps.dtype
+                    )
+
+            # Log ratio for importance sampling
+            log_ratio = per_token_logps - old_per_token_logps
+            coef_1 = torch.exp(log_ratio)  # Importance sampling ratio
+        else:
+            # No old logprobs - assume on-policy (ratio = 1)
+            coef_1 = torch.ones_like(per_token_logps)
+            log_ratio = torch.zeros_like(per_token_logps)
+
+        # === Compute Per-Token Loss Based on Loss Type ===
+        if loss_type == "cispo":
+            # CISPO: Clip importance weights, multiply with log probs
+            clamped_ratios = torch.clamp(coef_1, max=1 + epsilon_high).detach()
+            per_token_loss = -clamped_ratios * advantages * per_token_logps
+
+        elif loss_type == "sapo":
+            # SAPO: Soft adaptive with temperature control
+            sapo_temp_neg = 1.05
+            sapo_temp_pos = 1.0
+
+            per_token_loss = torch.empty_like(coef_1)
+            positive_mask = (advantages > 0).expand_as(coef_1)
+
+            # Soft clipping with sigmoid
+            def sapo_token_loss(ratio, temperature):
+                sigmoid_input = temperature * (ratio - 1)
+                return torch.sigmoid(sigmoid_input) * 4 / temperature
+
+            per_token_loss[positive_mask] = sapo_token_loss(
+                coef_1[positive_mask], sapo_temp_pos
+            )
+            per_token_loss[~positive_mask] = sapo_token_loss(
+                coef_1[~positive_mask], sapo_temp_neg
+            )
+            per_token_loss = -per_token_loss * advantages
+
+        else:
+            # GRPO/DAPO/BNPO/DR_GRPO: Two-sided clipping
+            # Clip ratio between (1 - epsilon_low, 1 + epsilon_high)
+            coef_2 = torch.clamp(coef_1, 1 - epsilon_low, 1 + epsilon_high)
+
+            # PPO-style loss: min of clipped and unclipped
+            per_token_loss1 = coef_1 * advantages
+            per_token_loss2 = coef_2 * advantages
+            per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
+
+        # === Add KL Penalty (if beta != 0) ===
+        if beta != 0.0 and old_logprobs is not None:
+            # KL divergence: E_p[log(p/q)] approximated as exp(log_q - log_p) - (log_q - log_p) - 1
+            per_token_kl = torch.exp(-log_ratio) - (-log_ratio) - 1
+            per_token_loss = per_token_loss + beta * per_token_kl
+
+        # === Aggregate Loss Based on Loss Type ===
+        if loss_type in ["grpo", "sapo"]:
+            # Normalize by sequence length (per-sequence mean, then batch mean)
+            seq_lengths = mask.sum(dim=-1).clamp(min=1.0)
+            loss = ((per_token_loss * mask).sum(dim=-1) / seq_lengths).mean()
+
+        elif loss_type == "bnpo":
+            # Normalize by total token count in batch
+            total_tokens = mask.sum().clamp(min=1.0)
+            loss = (per_token_loss * mask).sum() / total_tokens
+
+        elif loss_type == "dr_grpo":
+            # Normalize by (batch_size * max_completion_length)
+            max_completion_length = self.config.get("max_tokens", 512)
+            loss = (per_token_loss * mask).sum() / (batch_size * max_completion_length)
+
+        elif loss_type in ["cispo", "dapo"]:
+            # Normalize by total tokens across batch (global normalization)
+            total_tokens = mask.sum().clamp(min=1.0)
+            loss = (per_token_loss * mask).sum() / total_tokens
+
+        else:
+            # Fallback: simple mean
+            loss = (per_token_loss * mask).sum() / mask.sum().clamp(min=1.0)
+
+        # === Backward Pass ===
         self.trainer.accelerator.backward(loss)
         self.trainer.optimizer.step()
         self.trainer.optimizer.zero_grad()
 
+        # === Compute Metrics ===
+        with torch.no_grad():
+            # Clip ratio for logging
+            mean_ratio = coef_1[mask.bool()].mean().item() if mask.sum() > 0 else 1.0
+            clip_frac = ((coef_1 < 1 - epsilon_low) | (coef_1 > 1 + epsilon_high)).float()
+            clip_frac = (clip_frac * mask).sum() / mask.sum().clamp(min=1.0)
+
+            # KL divergence
+            if old_logprobs is not None:
+                approx_kl = (log_ratio * mask).sum() / mask.sum().clamp(min=1.0)
+            else:
+                approx_kl = torch.tensor(0.0)
+
         return {
             "loss": loss.item(),
             "mean_reward": rewards_tensor.mean().item(),
-            "mean_log_prob": seq_log_probs.mean().item(),
+            "mean_advantage": advantages.mean().item(),
+            "mean_ratio": mean_ratio,
+            "clip_fraction": clip_frac.item(),
+            "approx_kl": approx_kl.item(),
+            "loss_type": loss_type,
         }
 
     @modal.method()
@@ -330,7 +510,42 @@ class ActorWorker:
         print(f"Saving weights to {weights_path}...")
         start_time = time.time()
 
-        state_dict = model_to_save.state_dict()
+        # Handle LoRA models - merge weights for vLLM compatibility
+        if self.config.get("use_lora", False):
+            from peft import PeftModel
+            if isinstance(model_to_save, PeftModel):
+                print("  Merging LoRA weights for vLLM compatibility...")
+                # Merge LoRA adapters into base weights
+                model_to_save.merge_adapter()
+
+                # Get state dict and filter/rename keys for vLLM compatibility
+                raw_state_dict = model_to_save.state_dict()
+                state_dict = {}
+
+                for key, value in raw_state_dict.items():
+                    # Skip LoRA-specific parameters (lora_A, lora_B weights)
+                    if "lora_" in key:
+                        continue
+
+                    # Remove base_model.model. prefix
+                    clean_key = key.replace("base_model.model.", "")
+
+                    # Remove .base_layer from key names (LoRA wraps original layers)
+                    clean_key = clean_key.replace(".base_layer", "")
+
+                    state_dict[clean_key] = value
+
+                # Unmerge to allow continued LoRA training
+                model_to_save.unmerge_adapter()
+            else:
+                state_dict = model_to_save.state_dict()
+                state_dict = {
+                    k.replace("base_model.model.", "").replace("base_model.", ""): v
+                    for k, v in state_dict.items()
+                }
+        else:
+            state_dict = model_to_save.state_dict()
+
         # Convert to CPU and ensure contiguous for safetensors
         state_dict_cpu = {k: v.cpu().contiguous() for k, v in state_dict.items()}
         save_file(state_dict_cpu, weights_path)
@@ -397,9 +612,43 @@ class ActorWorker:
         if hasattr(model_to_save, "module"):
             model_to_save = model_to_save.module
 
-        # Save weights in safetensors format
+        # Handle LoRA models - merge weights for vLLM compatibility
         weights_path = f"{model_path}/model.safetensors"
-        state_dict = model_to_save.state_dict()
+        if self.config.get("use_lora", False):
+            from peft import PeftModel
+            if isinstance(model_to_save, PeftModel):
+                print("  Merging LoRA weights for vLLM compatibility...")
+                # Merge LoRA adapters into base weights
+                model_to_save.merge_adapter()
+
+                # Get state dict and filter/rename keys for vLLM compatibility
+                raw_state_dict = model_to_save.state_dict()
+                state_dict = {}
+
+                for key, value in raw_state_dict.items():
+                    # Skip LoRA-specific parameters (lora_A, lora_B weights)
+                    if "lora_" in key:
+                        continue
+
+                    # Remove base_model.model. prefix
+                    clean_key = key.replace("base_model.model.", "")
+
+                    # Remove .base_layer from key names (LoRA wraps original layers)
+                    clean_key = clean_key.replace(".base_layer", "")
+
+                    state_dict[clean_key] = value
+
+                # Unmerge to allow continued LoRA training
+                model_to_save.unmerge_adapter()
+            else:
+                state_dict = model_to_save.state_dict()
+                state_dict = {
+                    k.replace("base_model.model.", "").replace("base_model.", ""): v
+                    for k, v in state_dict.items()
+                }
+        else:
+            state_dict = model_to_save.state_dict()
+
         state_dict_cpu = {k: v.cpu().contiguous() for k, v in state_dict.items()}
         save_file(state_dict_cpu, weights_path)
 

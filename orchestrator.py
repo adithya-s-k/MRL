@@ -273,11 +273,19 @@ def train(config_dict: Optional[dict] = None):
             metrics = {
                 "train/loss": loss_result.get("loss", 0),
                 "train/mean_reward": mean_reward,
-                "train/mean_log_prob": loss_result.get("mean_log_prob", 0),
+                "train/mean_advantage": loss_result.get("mean_advantage", 0),
+                "train/mean_ratio": loss_result.get("mean_ratio", 1.0),
+                "train/clip_fraction": loss_result.get("clip_fraction", 0),
+                "train/approx_kl": loss_result.get("approx_kl", 0),
                 "train/epoch": epoch,
                 "train/step": global_step,
             }
             wandb.log(metrics, step=global_step)
+
+            # Print key metrics
+            print(f"  Loss: {loss_result.get('loss', 0):.4f}, "
+                  f"KL: {loss_result.get('approx_kl', 0):.4f}, "
+                  f"Clip: {loss_result.get('clip_fraction', 0):.2%}")
 
             # 5. Sync weights to rollout workers (periodically)
             if (global_step + 1) % config.training.sync_weights_every == 0:
@@ -470,30 +478,65 @@ def train_simple(config_dict: Optional[dict] = None):
 
     print(f"Dataset loaded with {len(dataset)} samples")
 
-    # Training config
-    training_args = GRPOConfig(
-        output_dir=f"{STORAGE_PATH}/checkpoints",
-        report_to=config.training.report_to,
-        use_vllm=False,
-        per_device_train_batch_size=config.training.batch_size,
-        gradient_accumulation_steps=config.training.gradient_accumulation_steps,
-        learning_rate=config.training.learning_rate,
-        num_train_epochs=config.training.num_epochs,
-        max_steps=config.training.max_steps,
-        save_steps=config.training.save_steps,
-        logging_steps=config.training.logging_steps,
-        num_generations=config.training.num_generations,
-        bf16=torch.cuda.is_bf16_supported(),
-        gradient_checkpointing=True,
-    )
+    # Build GRPOConfig kwargs
+    grpo_kwargs = {
+        "output_dir": f"{STORAGE_PATH}/checkpoints",
+        "report_to": config.training.report_to,
+        "use_vllm": False,
+        "per_device_train_batch_size": config.training.batch_size,
+        "gradient_accumulation_steps": config.training.gradient_accumulation_steps,
+        "learning_rate": config.training.learning_rate,
+        "num_train_epochs": config.training.num_epochs,
+        "max_steps": config.training.max_steps,
+        "save_steps": config.training.save_steps,
+        "logging_steps": config.training.logging_steps,
+        "num_generations": config.training.num_generations,
+        "bf16": torch.cuda.is_bf16_supported(),
+        "gradient_checkpointing": True,
+        # GRPO algorithm parameters (TRL built-in)
+        "loss_type": config.training.loss_type,
+        "beta": config.training.beta,
+        "epsilon": config.training.epsilon,
+        "scale_rewards": config.training.scale_rewards,
+        "mask_truncated_completions": config.training.mask_truncated_completions,
+    }
+
+    # Only add epsilon_high if specified
+    if config.training.epsilon_high is not None:
+        grpo_kwargs["epsilon_high"] = config.training.epsilon_high
+
+    training_args = GRPOConfig(**grpo_kwargs)
+
+    # Configure LoRA if enabled
+    peft_config = None
+    if config.training.use_lora:
+        from peft import LoraConfig, TaskType
+
+        target_modules = config.training.lora_target_modules
+        if target_modules is None:
+            target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+        peft_config = LoraConfig(
+            r=config.training.lora_r,
+            lora_alpha=config.training.lora_alpha,
+            lora_dropout=config.training.lora_dropout,
+            target_modules=target_modules,
+            task_type=TaskType.CAUSAL_LM,
+            bias="none",
+        )
+        print(f"LoRA enabled: r={peft_config.r}, alpha={peft_config.lora_alpha}")
 
     # Create trainer
-    trainer = GRPOTrainer(
-        model=config.model.model_name,
-        reward_funcs=reward_helper_function,
-        args=training_args,
-        train_dataset=dataset,
-    )
+    trainer_kwargs = {
+        "model": config.model.model_name,
+        "reward_funcs": reward_helper_function,
+        "args": training_args,
+        "train_dataset": dataset,
+    }
+    if peft_config is not None:
+        trainer_kwargs["peft_config"] = peft_config
+
+    trainer = GRPOTrainer(**trainer_kwargs)
 
     # Train
     trainer.train()

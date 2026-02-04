@@ -22,6 +22,19 @@ def main(
     sync_weights_every: int = 1,
     weight_sync_method: str = "direct",
     simple_mode: bool = False,
+    # GRPO algorithm parameters
+    loss_type: str = "dapo",
+    beta: float = 0.0,
+    epsilon: float = 0.2,
+    epsilon_high: float = None,
+    scale_rewards: str = "group",
+    mask_truncated_completions: bool = False,
+    max_completion_length: int = 1024,
+    # LoRA parameters
+    use_lora: bool = False,
+    lora_r: int = 16,
+    lora_alpha: int = 32,
+    lora_dropout: float = 0.05,
 ):
     """Launch GRPO training on Modal.
 
@@ -44,6 +57,17 @@ def main(
             "direct" - in-memory transfer (limited vLLM support)
             "checkpoint" - full checkpoint save + reload (slowest)
         simple_mode: Use TRL's built-in training loop instead of orchestrator (default: False)
+        loss_type: GRPO loss type - grpo, dr_grpo, dapo, bnpo, cispo, sapo (default: dapo)
+        beta: KL penalty coefficient, DeepSeek R1 uses 0.001 (default: 0.0)
+        epsilon: PPO-style clipping epsilon (default: 0.2)
+        epsilon_high: Upper clipping epsilon, DAPO recommends 0.28 (default: None)
+        scale_rewards: Reward scaling - group, batch, or none (default: group)
+        mask_truncated_completions: Whether to mask truncated completions (default: False)
+        max_completion_length: Max tokens per completion for training, truncates to save memory (default: 1024)
+        use_lora: Enable LoRA for parameter-efficient training (default: False)
+        lora_r: LoRA rank (default: 16)
+        lora_alpha: LoRA alpha scaling factor (default: 32)
+        lora_dropout: LoRA dropout rate (default: 0.05)
     """
     config = {
         "model_name": model,
@@ -59,6 +83,19 @@ def main(
         "save_steps": save_steps,
         "sync_weights_every": sync_weights_every,
         "weight_sync_method": weight_sync_method,
+        # GRPO algorithm parameters
+        "loss_type": loss_type,
+        "beta": beta,
+        "epsilon": epsilon,
+        "epsilon_high": epsilon_high,
+        "scale_rewards": scale_rewards,
+        "mask_truncated_completions": mask_truncated_completions,
+        "max_completion_length": max_completion_length,
+        # LoRA parameters
+        "use_lora": use_lora,
+        "lora_r": lora_r,
+        "lora_alpha": lora_alpha,
+        "lora_dropout": lora_dropout,
     }
 
     print("Starting GRPO training with config:")
@@ -73,6 +110,22 @@ def main(
         result = train.remote(config)
 
     print(f"\nTraining result: {result}")
+
+
+@app.local_entrypoint()
+def clear_cache(model: str = None):
+    """Clear corrupted model cache.
+
+    Usage:
+        modal run MRL/train.py::clear_cache              # List all cached models
+        modal run MRL/train.py::clear_cache --model Qwen/Qwen2-0.5B-Instruct  # Clear specific model
+    """
+    result = clear_model_cache_fn.remote(model)
+    if model is None:
+        print(f"\nFound {len(result)} cached models")
+    else:
+        if result:
+            print("\nYou can now run training again - it will download fresh weights.")
 
 
 # Separate test functions that can be run directly via modal run
@@ -162,3 +215,65 @@ def list_checkpoints_fn():
         print("  (no checkpoints found)")
 
     return checkpoints
+
+
+@app.function(
+    volumes={"/storage": volume},
+)
+def clear_model_cache_fn(model: str = None):
+    """Clear corrupted model cache from the volume.
+
+    Args:
+        model: Model name to clear (e.g., "Qwen/Qwen2-0.5B-Instruct").
+               If None, lists all cached models.
+    """
+    import os
+    import shutil
+
+    cache_dir = "/storage/model_cache"
+    print(f"Model cache directory: {cache_dir}")
+
+    if not os.path.exists(cache_dir):
+        print("  (no model cache directory found)")
+        return []
+
+    if model is None:
+        # List all cached models
+        print("\nCached models:")
+        cached = []
+        for item in sorted(os.listdir(cache_dir)):
+            item_path = os.path.join(cache_dir, item)
+            if os.path.isdir(item_path):
+                cached.append(item)
+                # Check if it looks corrupted (has base_model prefix in safetensors)
+                safetensors_path = os.path.join(item_path, "model.safetensors")
+                status = "✓"
+                if os.path.exists(safetensors_path):
+                    try:
+                        from safetensors import safe_open
+                        with safe_open(safetensors_path, framework="pt") as f:
+                            keys = list(f.keys())[:3]
+                            if any("base_model" in k for k in keys):
+                                status = "⚠ CORRUPTED (has base_model prefix)"
+                    except ImportError:
+                        status = "(safetensors not available to check)"
+                    except Exception as e:
+                        status = f"? (error: {e})"
+                print(f"  - {item} {status}")
+        return cached
+    else:
+        # Clear specific model
+        model_name_safe = model.replace("/", "_")
+        model_path = os.path.join(cache_dir, model_name_safe)
+
+        if os.path.exists(model_path):
+            print(f"\nClearing cache for: {model}")
+            print(f"  Path: {model_path}")
+            shutil.rmtree(model_path)
+            volume.commit()
+            print("  ✓ Cache cleared successfully")
+            print("  Next run will re-download fresh model from HuggingFace")
+            return True
+        else:
+            print(f"\n  No cache found for {model} at {model_path}")
+            return False

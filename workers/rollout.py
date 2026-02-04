@@ -223,7 +223,30 @@ class RolloutWorker:
         print(f"Initializing model at local path: {local_path}")
 
         # Check if we already have this model cached
+        need_download = False
         if not os.path.exists(local_path):
+            need_download = True
+        else:
+            # Validate cached model - check for corrupted weights from LoRA runs
+            safetensors_path = f"{local_path}/model.safetensors"
+            if os.path.exists(safetensors_path):
+                try:
+                    from safetensors import safe_open
+                    with safe_open(safetensors_path, framework="pt") as f:
+                        keys = list(f.keys())[:5]
+                        if any("base_model" in k or "lora_" in k for k in keys):
+                            print(f"  ⚠ Cached model has corrupted weights (LoRA artifacts)")
+                            print(f"  Clearing cache and re-downloading...")
+                            import shutil
+                            shutil.rmtree(local_path)
+                            need_download = True
+                except Exception as e:
+                    print(f"  Warning: Could not validate cache ({e}), using as-is")
+                    volume.reload()
+            else:
+                volume.reload()
+
+        if need_download:
             print(f"  Downloading {base_model} to volume...")
             os.makedirs(local_path, exist_ok=True)
 
@@ -235,9 +258,8 @@ class RolloutWorker:
             )
             print(f"  Model cached at {local_path}")
             volume.commit()
-        else:
+        elif os.path.exists(local_path):
             print(f"  Using cached model at {local_path}")
-            volume.reload()
 
         # Free GPU memory if model exists
         if self.llm is not None:

@@ -36,6 +36,31 @@ class TrainingConfig:
 
     # GRPO specific
     num_generations: int = 4  # Number of generations per prompt for GRPO
+
+    # GRPO algorithm parameters (passed to TRL's GRPOConfig)
+    # Loss type: grpo, dr_grpo, dapo, bnpo, cispo, sapo
+    loss_type: str = "dapo"
+    # KL coefficient (DeepSeek R1 uses 0.001)
+    beta: float = 0.0
+    # PPO-style clipping epsilon
+    epsilon: float = 0.2
+    # Upper clipping epsilon (DAPO recommends 0.28, None to disable)
+    epsilon_high: Optional[float] = None
+    # Reward scaling: "group", "batch", or "none"
+    scale_rewards: str = "group"
+    # Whether to mask truncated completions (DAPO paper)
+    mask_truncated_completions: bool = False
+    # Max completion length for training (truncates long completions to save memory)
+    max_completion_length: int = 1024
+
+    # LoRA parameters
+    use_lora: bool = False
+    lora_r: int = 16  # LoRA rank
+    lora_alpha: int = 32  # LoRA alpha (scaling factor)
+    lora_dropout: float = 0.05
+    lora_target_modules: Optional[list] = None  # None means auto-detect
+
+    # Legacy (kept for backwards compatibility, use beta instead)
     kl_coef: float = 0.1
 
     # Checkpointing
@@ -94,6 +119,18 @@ class OrchestratorConfig:
             "gradient_accumulation_steps": self.training.gradient_accumulation_steps,
             "learning_rate": self.training.learning_rate,
             "num_generations": self.training.num_generations,
+            "loss_type": self.training.loss_type,
+            "beta": self.training.beta,
+            "epsilon": self.training.epsilon,
+            "epsilon_high": self.training.epsilon_high,
+            "scale_rewards": self.training.scale_rewards,
+            "mask_truncated_completions": self.training.mask_truncated_completions,
+            "max_completion_length": self.training.max_completion_length,
+            "use_lora": self.training.use_lora,
+            "lora_r": self.training.lora_r,
+            "lora_alpha": self.training.lora_alpha,
+            "lora_dropout": self.training.lora_dropout,
+            "lora_target_modules": self.training.lora_target_modules,
             "kl_coef": self.training.kl_coef,
             "save_steps": self.training.save_steps,
             "checkpoint_dir": self.training.checkpoint_dir,
@@ -129,6 +166,18 @@ class OrchestratorConfig:
             gradient_accumulation_steps=d.get("gradient_accumulation_steps", 1),
             learning_rate=d.get("learning_rate", 5e-6),
             num_generations=d.get("num_generations", 4),
+            loss_type=d.get("loss_type", "dapo"),
+            beta=d.get("beta", 0.0),
+            epsilon=d.get("epsilon", 0.2),
+            epsilon_high=d.get("epsilon_high"),
+            scale_rewards=d.get("scale_rewards", "group"),
+            mask_truncated_completions=d.get("mask_truncated_completions", False),
+            max_completion_length=d.get("max_completion_length", 1024),
+            use_lora=d.get("use_lora", False),
+            lora_r=d.get("lora_r", 16),
+            lora_alpha=d.get("lora_alpha", 32),
+            lora_dropout=d.get("lora_dropout", 0.05),
+            lora_target_modules=d.get("lora_target_modules"),
             kl_coef=d.get("kl_coef", 0.1),
             save_steps=d.get("save_steps", 100),
             checkpoint_dir=d.get("checkpoint_dir", "/storage/checkpoints"),
