@@ -20,6 +20,7 @@ Usage:
 from MRL.app import app, volume, TRAINING_IMAGE, VLLM_IMAGE
 from MRL.config import OrchestratorConfig, ModelConfig, TrainingConfig, GenerationConfig
 from MRL.trainer import MRLTrainer
+from MRL.rewards.base import RewardEnvironment, SandboxConfig, FunctionConfig, ExecutionResult
 
 __all__ = [
     "app",
@@ -31,4 +32,8 @@ __all__ = [
     "TrainingConfig",
     "GenerationConfig",
     "MRLTrainer",
+    "RewardEnvironment",
+    "SandboxConfig",
+    "FunctionConfig",
+    "ExecutionResult",
 ]

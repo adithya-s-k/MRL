@@ -1,4 +1,8 @@
-"""Reward computation using Modal Sandboxes for code execution."""
+"""Reward computation using Modal Sandboxes for code execution.
+
+NOTE: This module is kept for backward compatibility. For new code, prefer
+using the MRL.rewards package (RewardEnvironment, CodeExecutionEnvironment, etc.).
+"""
 
 from typing import Iterable, Sequence
 

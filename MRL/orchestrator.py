@@ -9,6 +9,7 @@ from MRL.config import OrchestratorConfig
 from MRL.workers.actor import ActorWorker
 from MRL.workers.rollout import RolloutWorker
 from MRL.rewards import compute_rewards
+from MRL.rewards.base import RewardEnvironment
 
 STORAGE_PATH = "/storage"
 
@@ -264,6 +265,7 @@ def train(config_dict: Optional[dict] = None, reward_funcs=None):
             rewards = compute_rewards(
                 reward_funcs=reward_funcs,
                 completions=all_completions,
+                prompts=expanded_prompts,
                 testcases=expanded_testcases,
             )
             mean_reward = sum(rewards) / len(rewards) if rewards else 0
@@ -558,7 +560,7 @@ def train_simple(config_dict: Optional[dict] = None):
     return {"status": "completed"}
 
 
-def train_local(config_dict: dict, reward_funcs, train_dataset=None):
+def train_local(config_dict: dict, reward_funcs, train_dataset=None, reward_weights=None):
     """Local orchestrator - runs on user's CPU with custom reward functions.
 
     Same training loop as train() but:
@@ -569,9 +571,12 @@ def train_local(config_dict: dict, reward_funcs, train_dataset=None):
 
     Args:
         config_dict: Configuration dictionary
-        reward_funcs: Custom reward function(s) (callable or list of callables)
+        reward_funcs: Custom reward function(s) - callable, RewardEnvironment,
+            or list of either.
         train_dataset: Optional HuggingFace Dataset with "prompt" column.
             If None, loads from config dataset settings.
+        reward_weights: Optional list of weights for combining multiple
+            reward functions.
     """
     import time
 
@@ -696,6 +701,15 @@ def train_local(config_dict: dict, reward_funcs, train_dataset=None):
     else:
         current_rollout_model_path = config.model.model_name
 
+    # Call setup() on RewardEnvironment instances
+    reward_envs = []
+    if isinstance(reward_funcs, list):
+        reward_envs = [rf for rf in reward_funcs if isinstance(rf, RewardEnvironment)]
+    elif isinstance(reward_funcs, RewardEnvironment):
+        reward_envs = [reward_funcs]
+    for env in reward_envs:
+        env.setup()
+
     # Training loop
     global_step = 0
     for epoch in range(config.training.num_epochs):
@@ -760,6 +774,8 @@ def train_local(config_dict: dict, reward_funcs, train_dataset=None):
             rewards = compute_rewards(
                 reward_funcs=reward_funcs,
                 completions=all_completions,
+                prompts=expanded_prompts,
+                weights=reward_weights,
                 **expanded_kwargs,
             )
             mean_reward = sum(rewards) / len(rewards) if rewards else 0
@@ -880,6 +896,10 @@ def train_local(config_dict: dict, reward_funcs, train_dataset=None):
                 print(f"Checkpoint saved: {checkpoint_path}")
 
             global_step += 1
+
+    # Call teardown() on RewardEnvironment instances
+    for env in reward_envs:
+        env.teardown()
 
     # Final checkpoint
     print("\nSaving final checkpoint...")

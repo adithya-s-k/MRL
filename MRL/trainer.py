@@ -1,6 +1,7 @@
 """MRLTrainer - TRL-like programmatic API for MRL training."""
 
 from MRL.config import OrchestratorConfig
+from MRL.rewards.base import RewardEnvironment
 
 
 class MRLTrainer:
@@ -26,12 +27,31 @@ class MRLTrainer:
             max_steps=5,
         )
         trainer.train()
+
+        # RewardEnvironment (code execution with custom sandbox)
+        from MRL.rewards.examples import CodeExecutionEnvironment
+        from MRL.rewards import SandboxConfig
+        env = CodeExecutionEnvironment(
+            partial_credit=True,
+            sandbox_cfg=SandboxConfig(image=modal.Image.debian_slim().pip_install("numpy")),
+        )
+        trainer = MRLTrainer(reward_funcs=env, train_dataset=ds)
+        trainer.train()
+
+        # Mixed rewards with weights
+        trainer = MRLTrainer(
+            reward_funcs=[env, length_reward],
+            reward_weights=[0.7, 0.3],
+            train_dataset=ds,
+        )
+        trainer.train()
     """
 
     def __init__(
         self,
         model="Qwen/Qwen2.5-0.5B-Instruct",
         reward_funcs=None,
+        reward_weights=None,
         train_dataset=None,
         num_generations=4,
         learning_rate=5e-6,
@@ -70,8 +90,12 @@ class MRLTrainer:
             model: Model name or HuggingFace path.
             reward_funcs: Reward function(s). One of:
                 - None or "sandbox": uses Modal Sandbox code execution (default)
+                - RewardEnvironment: custom environment with score() method
                 - callable: custom reward function(completions=..., **kwargs)
-                - list of callables: multiple rewards, averaged
+                - list of the above: multiple rewards, weighted average
+            reward_weights: Optional list of weights for combining multiple
+                reward functions. If None, uses RewardEnvironment.weight
+                for environments and 1.0 for callables.
             train_dataset: HuggingFace Dataset with "prompt" column.
                 Required for custom reward_funcs, optional for sandbox mode.
             num_generations: Number of generations per prompt for GRPO.
@@ -106,6 +130,7 @@ class MRLTrainer:
             **kwargs: Additional config overrides.
         """
         self.reward_funcs = reward_funcs
+        self.reward_weights = reward_weights
         self.train_dataset = train_dataset
 
         config_dict = {
@@ -161,6 +186,7 @@ class MRLTrainer:
         # Import orchestrator (and transitively all workers) so that
         # app.run() discovers and hydrates all Modal functions/classes.
         from MRL import orchestrator as _orch  # noqa: F841
+        import MRL.rewards.function_executor  # noqa: F401  — hydrate _run_on_training_image
 
         with modal.enable_output():
             with app.run():
@@ -168,9 +194,11 @@ class MRLTrainer:
                     print("Using remote orchestrator (sandbox rewards on Modal)")
                     return _orch.train.remote(self.config.to_dict())
                 else:
-                    print("Using local orchestrator (custom rewards on CPU)")
+                    # RewardEnvironment, callable, or list -> local orchestrator
+                    print("Using local orchestrator (custom rewards)")
                     return _orch.train_local(
                         self.config.to_dict(),
                         self.reward_funcs,
                         self.train_dataset,
+                        self.reward_weights,
                     )
