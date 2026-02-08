@@ -37,6 +37,9 @@ def main(
     lora_dropout: float = 0.05,
     # Memory optimizations
     gradient_checkpointing: bool = True,
+    # GPU allocation
+    actor_gpu: str = "A100",
+    rollout_gpu: str = "A10G",
 ):
     """Launch GRPO training on Modal.
 
@@ -71,6 +74,8 @@ def main(
         lora_alpha: LoRA alpha scaling factor (default: 32)
         lora_dropout: LoRA dropout rate (default: 0.05)
         gradient_checkpointing: Enable gradient checkpointing to save memory (default: True)
+        actor_gpu: GPU type for the actor worker (default: A100)
+        rollout_gpu: GPU type for rollout workers (default: A10G)
     """
     config = {
         "model_name": model,
@@ -101,6 +106,9 @@ def main(
         "lora_dropout": lora_dropout,
         # Memory optimizations
         "gradient_checkpointing": gradient_checkpointing,
+        # GPU allocation
+        "actor_gpu": actor_gpu,
+        "rollout_gpu": rollout_gpu,
     }
 
     print("Starting GRPO training with config:")

@@ -79,7 +79,7 @@ class TrainingConfig:
     # Sync method:
     #   "reload" (recommended) - uses vLLM v1 sleep/wake_up/reload_weights for efficient updates
     #   "volume" - saves to shared volume, workers reload from volume (recreates model)
-    #   "direct" - in-memory transfer (vLLM 0.15.0 doesn't support custom weights)
+    #   "direct" - in-memory transfer via vLLM's load_weights()
     #   "checkpoint" - full checkpoint save + model recreation (slowest)
     weight_sync_method: str = "reload"
 
@@ -99,6 +99,10 @@ class OrchestratorConfig:
 
     # Workers
     num_rollout_workers: int = 2
+
+    # GPU allocation
+    actor_gpu: str = "A100"    # "A100", "H100", "A10G", etc.
+    rollout_gpu: str = "A10G"  # "A10G", "A100", "L4", etc.
 
     # Data
     dataset_name: str = "OpenCoder-LLM/opc-sft-stage2"
@@ -143,6 +147,8 @@ class OrchestratorConfig:
             "sync_weights_every": self.training.sync_weights_every,
             "weight_sync_method": self.training.weight_sync_method,
             "num_rollout_workers": self.num_rollout_workers,
+            "actor_gpu": self.actor_gpu,
+            "rollout_gpu": self.rollout_gpu,
             "dataset_name": self.dataset_name,
             "dataset_config": self.dataset_config,
             "dataset_split": self.dataset_split,
@@ -196,6 +202,8 @@ class OrchestratorConfig:
             generation=generation,
             training=training,
             num_rollout_workers=d.get("num_rollout_workers", 2),
+            actor_gpu=d.get("actor_gpu", "A100"),
+            rollout_gpu=d.get("rollout_gpu", "A10G"),
             dataset_name=d.get("dataset_name", "OpenCoder-LLM/opc-sft-stage2"),
             dataset_config=d.get("dataset_config", "educational_instruct"),
             dataset_split=d.get("dataset_split", "train"),
